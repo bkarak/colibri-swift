@@ -3,3 +3,4 @@
 *.gguf
 DerivedData/
 .DS_Store
+.build-*/
