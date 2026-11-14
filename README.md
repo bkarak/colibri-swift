@@ -195,6 +195,19 @@ With a short prompt Metal decodes Qwen3-0.6B at about 233 tok/s; after a 2048-to
 194. The GPU is busy for about 93% of the wall time during decode. There is no comparison
 with upstream's speed: its macOS build here has no OpenMP, so it runs on one core.
 
+Against llama.cpp v1.0.0 on the same machine and files (tok/s, llama.cpp / coli-swift; decode
+after 512 tokens of context):
+
+| model | Metal prefill: llama.cpp / coli-swift | Metal decode | CPU prefill | CPU decode |
+|---|---|---|---|---|
+| Qwen3-0.6B Q8_0 | 10712 / 1981 (5.4x) | 339 / 215 (1.6x) | 2315 / 365 (6.3x) | 220 / 42.4 (5.2x) |
+| Qwen3-4B Q4_K_M | 1625 / 278 (5.8x) | 118 / 87 (1.35x) | 276 / 50.3 (5.5x) | 67.4 / 12.1 (5.6x) |
+| OLMoE-1B-7B-0125-Instruct Q4_K_M | 4080 / 635 (6.4x) | 322 / 221 (1.5x) | 550 / 85.1 (6.5x) | 199 / 30.9 (6.4x) |
+| Qwen3-30B-A3B Q4_K_M | 1660 / 226 (7.3x) | 128 / 81 (1.6x) | 210 / 35.2 (6.0x) | 69.3 / 11.3 (6.1x) |
+
+llama.cpp is 1.35-1.6x faster at Metal decode, 5-7x at Metal prefill and 5-7x on the CPU.
+Method and where the gap comes from: `docs/port/status.md` section 3.
+
 ## Adding a model family
 
 A family is one Swift file in `Sources/ColibriCore/Models/` and one line in

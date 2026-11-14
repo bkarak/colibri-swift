@@ -98,14 +98,14 @@ Before the split-KV attention kernel (one threadgroup per head) these were 110 t
 the remaining cost is in the kernels, not in host round trips.
 
 OLMoE-1B-7B-0125-Instruct Q4_K_M, same settings: Metal 640 tok/s prefill, 231 decode; CPU
-81 and 28.9.
+81 and 28.9. A two-turn chat on Metal reused all 139 tokens of turn 1 from the KV cache.
 
 Qwen3-4B Q4_K_M (2.3 GiB, dense), same settings, median of 3: Metal 279 tok/s prefill, 87
 decode (f16 KV: 283 and 92); CPU 44.6 and 10.7; CPU `--int8` 13.3 and 9.7 (see section 4).
 Decode reads about 2.5 GB of weights per token, so 87 tok/s is about 215 GB/s, about 40% of
 the M4 Max's 546 GB/s. Prefill uses the decode matvec kernel over groups of tokens, in
 fp32; it has no simdgroup-matrix (tiled matrix-multiply) kernel, which is where llama.cpp's
-prefill speed comes from. A two-turn chat on Metal reused all 139 tokens of turn 1 from the KV cache.
+prefill speed comes from.
 
 Qwen3-30B-A3B Q4_K_M, 512-token prompt, 128 generated tokens, `--batch 64`, median of 2:
 Metal resident 222 tok/s prefill, 84 decode; CPU resident 32 and 10.7. Streamed on Metal
@@ -113,6 +113,41 @@ with `--direct` (128 tokens of `generate`): 29.9 / 27.0 / 25.4 tok/s decode with
 caches. Those reads came from the file cache (24-56 GB/s), not the SSD: `F_NOCACHE` does not
 evict pages already cached, and the whole file was. A disk-bound measurement needs
 `sudo purge` before the run; it has not been done.
+
+### Against llama.cpp
+
+All four models resident, tok/s (llama.cpp / coli-swift):
+
+| model | Metal prefill: llama.cpp / coli-swift | Metal decode | CPU prefill | CPU decode |
+|---|---|---|---|---|
+| Qwen3-0.6B Q8_0 | 10712 / 1981 (5.4x) | 339 / 215 (1.6x) | 2315 / 365 (6.3x) | 220 / 42.4 (5.2x) |
+| Qwen3-4B Q4_K_M | 1625 / 278 (5.8x) | 118 / 87 (1.35x) | 276 / 50.3 (5.5x) | 67.4 / 12.1 (5.6x) |
+| OLMoE-1B-7B-0125-Instruct Q4_K_M | 4080 / 635 (6.4x) | 322 / 221 (1.5x) | 550 / 85.1 (6.5x) | 199 / 30.9 (6.4x) |
+| Qwen3-30B-A3B Q4_K_M | 1660 / 226 (7.3x) | 128 / 81 (1.6x) | 210 / 35.2 (6.0x) | 69.3 / 11.3 (6.1x) |
+
+llama.cpp v1.0.0 (`b1b770d`), built from source with CMake (Release, Metal and Accelerate,
+no curl), `llama-bench -p 512 -n 128 -r 3`, decode measured at depth 512 (`-p 0 -n 128 -d 512`)
+to match coli-swift's decode after a 512-token prompt; its defaults otherwise (f16 KV cache,
+flash attention auto, `-ngl 99`). CPU: `-ngl 0 -dev none -t 12`. With `-t 16` llama.cpp's CPU
+decode collapses (Qwen3-4B 2.8 tok/s, Qwen3-0.6B 8.5) as threads land on the efficiency cores;
+12 is its default and the performance-core count. coli-swift: `bench --prompt-tokens 512
+--max-tokens 128 --runs 3`, default `--batch 64` and f32 KV on Metal, the better of
+`--threads 12` and `16` on the CPU (within 10% of each other). Same machine, same session,
+same GGUF files, 2026-11-14.
+
+Where the gap most likely comes from (from how llama.cpp is built; not profiled here):
+
+- **Metal prefill (5-7x).** llama.cpp switches to tiled matrix-multiply kernels
+  (`simdgroup_matrix`, half precision) once a batch has more than a few tokens. coli-swift
+  runs the decode matvec over groups of tokens, in fp32.
+- **Metal decode (1.35-1.6x).** Both are bound by reading the weights. llama.cpp's kernels
+  reach about 55% of the memory bandwidth on Qwen3-4B, coli-swift's about 40%; llama.cpp
+  also fuses more of each layer (norm, rope, flash attention) into fewer dispatches.
+- **CPU (5-7x).** llama.cpp quantises activations to 8 bits and uses the NEON int8
+  dot-product and matrix instructions (`sdot`, `smmla`), plus Accelerate for large prompt
+  batches. coli-swift's default CPU path dequantises every weight to fp32 to stay
+  bit-close to upstream's float reference, and its `--int8` path is scalar Swift
+  (section 4). llama.cpp's CPU decode is close to coli-swift's Metal decode.
 
 ## 4. Known gaps
 
