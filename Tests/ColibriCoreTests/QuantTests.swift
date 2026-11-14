@@ -248,6 +248,36 @@ func referenceDot(_ a: [Float], _ b: [Float], _ off: Int = 0) -> (value: Double,
         #expect(abs(Double(y) - ref.value) <= 0.01 * ref.magnitude, "\(type): \(y) vs \(ref.value)")
     }
 
+    /// The batch path (row unpacked once, `unpackRowQ8` + `dotQ8Unpacked`) gives the same
+    /// bits as `dotQ8` for every block type and several activation rows.
+    @Test(arguments: portTypes)
+    func unpackedRowDotIsBitIdentical(_ type: GGMLType) throws {
+        guard IntegerForm.supports(type), type != .q8_0 else { return }
+        var rng = TestRNG(UInt64(type.rawValue) + 909)
+        let cols = 2048, rows = 5
+        let bytes = try Quantize.encode(rng.floats(cols, scale: 0.2), as: type)
+        let x = rng.floats(rows * cols)
+        let act = Q8Activations()
+        x.withUnsafeBufferPointer { act.quantize($0.baseAddress!, rows: rows, cols: cols) }
+        var w8 = [Int8](repeating: 0, count: cols)
+        var sc = [Float](repeating: .nan, count: 2 * cols / 16 + 1)
+        sc[2 * cols / 16] = 12345  // guard value just past the mins
+        bytes.withUnsafeBytes { raw in
+            w8.withUnsafeMutableBufferPointer { w in
+                sc.withUnsafeMutableBufferPointer { s in
+                    let sw = s.baseAddress!, mw = sw + cols / 16
+                    Dot.unpackRowQ8(type, row: raw.baseAddress!, cols: cols, w8: w.baseAddress!, sw: sw, mw: mw)
+                    for r in 0..<rows {
+                        let a = Dot.dotQ8(type, row: raw.baseAddress!, act, row: r)
+                        let b = Dot.dotQ8Unpacked(type, w8: w.baseAddress!, sw: sw, mw: mw, act, row: r)
+                        #expect(a.bitPattern == b.bitPattern, "\(type) row \(r): \(a) vs \(b)")
+                    }
+                }
+            }
+        }
+        #expect(sc[2 * cols / 16] == 12345, "\(type): unpack wrote past cols / 16 mins")
+    }
+
     @Test func encoderRefusesUndecodableTypes() {
         #expect(throws: ColibriError.self) { try Quantize.encode([Float](repeating: 0, count: 256), as: .iq2_xxs) }
         #expect(throws: ColibriError.self) { try Quantize.encode([Float](repeating: 0, count: 33), as: .q8_0) }

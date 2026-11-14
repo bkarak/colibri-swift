@@ -50,7 +50,7 @@ DIVERGED with the step.
 | resident vs streamed experts, 4 synthetic MoE models x 128 tokens | CPU, Metal | identical ids | none |
 | Metal vs CPU, Qwen3-0.6B, 5 prompts x 128 tokens, f32 and f16 KV | | identical ids | none |
 | Metal vs CPU, Qwen3-0.6B, 2654-token prompt x 96 tokens, f32 and f16 KV | | identical ids | none |
-| `--int8` vs upstream's default int8-activation path | CPU | Qwen3-0.6B 5/5, Qwen3-4B 5/5; synthetic 54/64 | see section 4 |
+| `--int8` vs upstream's default int8-activation path | CPU | Qwen3-0.6B 5/5, Qwen3-4B 5/5, Qwen3-30B-A3B 3/5 (`chat_france` step 5, `chat_haiku` step 29); synthetic 54/64 | see section 4 |
 | upstream's golden quant blocks (14 types) fed straight into the Metal embed and decode matvec (`MetalSupportTests`) | Metal | embed bit-exact for 13 types; BF16: subnormals flushed to 0 (see section 4); matvec within 1e-5 x magnitude of `gq_matmul_f32` | |
 | unsupported shape (synthetic qwen3 with head dim 512), release CLI | Metal / auto | refused at load with the limit named; `--backend auto` loads it on the CPU (finite logits) | |
 | expert read failure (streamed qwen3moe truncated after load, prefill routing to the lost expert) | CPU, Metal | the forward throws (`FailureModeTests`, `MetalSupportTests`) | |
@@ -101,7 +101,7 @@ OLMoE-1B-7B-0125-Instruct Q4_K_M, same settings: Metal 640 tok/s prefill, 231 de
 81 and 28.9. A two-turn chat on Metal reused all 139 tokens of turn 1 from the KV cache.
 
 Qwen3-4B Q4_K_M (2.3 GiB, dense), same settings, median of 3: Metal 279 tok/s prefill, 87
-decode (f16 KV: 283 and 92); CPU 44.6 and 10.7; CPU `--int8` 13.3 and 9.7 (see section 4).
+decode (f16 KV: 283 and 92); CPU 44.6 and 10.7; CPU `--int8` 54.8 and 15.7.
 Decode reads about 2.5 GB of weights per token, so 87 tok/s is about 215 GB/s, about 40% of
 the M4 Max's 546 GB/s. Prefill uses the decode matvec kernel over groups of tokens, in
 fp32; it has no simdgroup-matrix (tiled matrix-multiply) kernel, which is where llama.cpp's
@@ -146,8 +146,10 @@ Where the gap most likely comes from (from how llama.cpp is built; not profiled 
 - **CPU (5-7x).** llama.cpp quantises activations to 8 bits and uses the NEON int8
   dot-product and matrix instructions (`sdot`, `smmla`), plus Accelerate for large prompt
   batches. coli-swift's default CPU path dequantises every weight to fp32 to stay
-  bit-close to upstream's float reference, and its `--int8` path is scalar Swift
-  (section 4). llama.cpp's CPU decode is close to coli-swift's Metal decode.
+  bit-close to upstream's float reference; its `--int8` path uses `sdot` but still does
+  the per-16 scaling in scalar floats, and runs MoE expert rows one token at a time.
+  llama.cpp's CPU decode is close to coli-swift's Metal decode. (Measured before the
+  `--int8` fix below; the float path is unchanged.)
 
 ## 4. Known gaps
 
@@ -188,12 +190,27 @@ accumulation order differs. 10 of 64 synthetic cases diverge from upstream's
 int8 greedy ids (for example `qwen3_q4_K_M` prompt 2 at step 0, where upstream's own int8
 top-2 gap is 0.0026); Qwen3-0.6B matches on all 5 prompts.
 
-**`--int8` prefill is slow on K-quants.** The integer path unpacks a K-quant weight row
-(Q4_K, Q5_K, Q6_K and the other non-Q8_0 types) once per token of the batch, where the
-float path dequantises it once per batch, so on Qwen3-4B Q4_K_M `--int8` prefill runs at
-13 tok/s against the float path's 45. Q8_0 has its own loop and is not affected
-(Qwen3-0.6B: 759 against 345). Unpacking each row once per batch would fix it without
-changing the arithmetic.
+**`--int8` on K-quants (fixed).** The integer path was slower than the float path on
+every type but Q8_0 (Qwen3-4B Q4_K_M: 13 tok/s prefill against 47). The cause was its
+16-wide int8 dot: LLVM unrolled the loop into scalar multiply-adds (`ldursb` + `smaddl`
+per value) instead of vectorising it; Q8_0's 32-wide loop did get `sdot`. It is now one
+NEON `sdot` per 16 values (`colibri_dot_i8_16x2`, the C target `CColibriKernels`), and a
+batch unpacks each weight row once instead of once per token. Integer sums are exact and
+the float arithmetic is untouched, so outputs are bit-identical (checked per type in
+`QuantTests.unpackedRowDotIsBitIdentical`, and the `--int8` oracle comparison gives the
+same 14 divergences at the same steps as before). CPU `--int8`, 512-token prompt then 128
+tokens, before / after:
+
+| model | prefill tok/s | decode tok/s |
+|---|---|---|
+| Qwen3-4B Q4_K_M | 13.0 / 54.8 | 9.2 / 15.7 |
+| OLMoE-1B-7B-0125-Instruct Q4_K_M | 46.1 / 140.7 | 24.1 / 40.5 |
+| Qwen3-30B-A3B Q4_K_M | 18.8 / 60.8 | 9.2 / 13.3 |
+| Qwen3-0.6B Q8_0 (unaffected) | 663 / 640 | 68.3 / 67.9 |
+
+`--int8` is now faster than the float path on all four. Still left: MoE expert matmuls
+run one token at a time on the CPU (each pair is its own product), and the per-16 float
+scaling is scalar.
 
 **Metal and large files.** A file mapping is wrapped one tensor at a time, so a file may
 be larger than `maxBufferLength` (41.7 GB here); only a single tensor (a stacked expert

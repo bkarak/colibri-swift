@@ -31,8 +31,11 @@ let package = Package(
         .executable(name: "coli-swift", targets: ["coli-swift"]),
     ],
     targets: [
+        // NEON integer kernels Swift does not vectorise (static inline, no dependencies).
+        .target(name: "CColibriKernels"),
         .target(
             name: "ColibriCore",
+            dependencies: ["CColibriKernels"],
             swiftSettings: engineSettings
         ),
         .target(

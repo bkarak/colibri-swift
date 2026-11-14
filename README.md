@@ -126,7 +126,7 @@ runs `coli-swift generate` on every fixture prompt and reports the first diverge
 | resident vs streamed experts, 4 synthetic MoE models x 128 tokens | identical | identical |
 | Metal vs CPU on Qwen3-0.6B: 5 prompts x 128 tokens, f32 and f16 KV | | identical |
 | Metal vs CPU on Qwen3-0.6B: a 2654-token prompt x 96 tokens, f32 and f16 KV | | identical |
-| `--int8` vs upstream's default int8 path | Qwen3-0.6B 5/5, Qwen3-4B 5/5, synthetic 54/64 (see `docs/port/status.md`) | n/a |
+| `--int8` vs upstream's default int8 path | Qwen3-0.6B 5/5, Qwen3-4B 5/5, Qwen3-30B-A3B 3/5, OLMoE 3/5, synthetic 54/64 (see `docs/port/status.md`) | n/a |
 | upstream's golden quant blocks (14 types) through the Metal kernels | | embed bit-exact except BF16 subnormals (flushed to 0); matvec within 1e-5 of magnitude of upstream's `gq_matmul_f32` |
 | a model shape Metal does not support (synthetic qwen3, head dim 512), release build | runs, finite logits | refused at load; `--backend auto` falls back to the CPU |
 | an expert read that fails mid-run (streamed qwen3moe, file truncated after load) | the forward throws | the forward throws |
@@ -181,7 +181,7 @@ Qwen3-4B Q4_K_M (2.3 GiB, dense, 4B parameters per token), same settings, 3 runs
 | Metal, f32 KV | 279 | 87 |
 | Metal, f16 KV | 283 | 92 |
 | CPU, float path | 44.6 | 10.7 |
-| CPU, `--int8` | 13.3 | 9.7 (slow on K-quants, see `docs/port/status.md`) |
+| CPU, `--int8` | 54.8 | 15.7 |
 
 The dense 4B decodes at the speed of the 30B MoE (87 against 84 tok/s): both read about
 the same weight bytes per token.

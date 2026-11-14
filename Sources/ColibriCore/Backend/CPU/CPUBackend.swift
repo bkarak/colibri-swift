@@ -96,7 +96,21 @@ public final class CPUBackend: Backend {
     private func rowsProduct(_ type: GGMLType, base: UnsafeRawPointer, rowBytes: Int, cols: Int, range: Range<Int>,
                              scale: Float, x: UnsafePointer<Float>, xRow0: Int, batch: Int,
                              y: UnsafeMutablePointer<Float>, yStride: Int, integer: Bool) {
-        if integer {
+        if integer && batch > 1 && type != .q8_0 {
+            // Unpack each row once for the whole batch (Q8_0's codes are already int8).
+            let nu = cols / 16
+            withUnsafeTemporaryAllocation(of: Int8.self, capacity: cols) { w8b in
+                withUnsafeTemporaryAllocation(of: Float.self, capacity: 2 * nu) { scb in
+                    let w8 = w8b.baseAddress!, sw = scb.baseAddress!, mw = sw + nu
+                    for o in range {
+                        Dot.unpackRowQ8(type, row: base + o * rowBytes, cols: cols, w8: w8, sw: sw, mw: mw)
+                        for s in 0..<batch {
+                            y[s * yStride + o] = scale * Dot.dotQ8Unpacked(type, w8: w8, sw: sw, mw: mw, q8, row: xRow0 + s)
+                        }
+                    }
+                }
+            }
+        } else if integer {
             for o in range {
                 let row = base + o * rowBytes
                 for s in 0..<batch {

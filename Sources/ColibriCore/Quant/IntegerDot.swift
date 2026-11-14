@@ -1,3 +1,4 @@
+import CColibriKernels
 // The integer path: activations quantised to int8 per 32 values, weights unpacked to
 // int8 codes plus a scale and a min per 16, exact integer inner sums. Ported from
 // colibri c/ggml_quants.h (gq_quant_act_ref, gq_ublk, gq_dot_i8, gq_dot_q8_0);
@@ -5,9 +6,10 @@
 // float path (Dot.swift, = upstream GQ_EXACT=1) is the reference. The only
 // approximation against it is the activation's rounding to int8.
 //
-// The integer inner loops are written as plain scalar loops: LLVM turns
-// `sum += Int32(w[i]) &* Int32(x[i])` into NEON `sdot` (checked in the assembly), which
-// Swift's SIMD conversion initialisers do not reach.
+// Q8_0's 32-wide inner loop is a plain scalar loop, which LLVM turns into NEON `sdot`
+// (checked in the assembly). The 16-wide loops of the other types are not vectorised
+// (LLVM unrolls them to scalar multiply-adds first), so they call `colibri_dot_i8_16x2`
+// (CColibriKernels, one `sdot` per 16 values).
 
 /// Activation rows quantised the way `gq_quant_act_ref` does it: per block of 32,
 /// `dx = amax / 127`, `xq = clamp(lrint(v * 127 / amax), -127, 127)`, and the code sums
@@ -230,33 +232,65 @@ extension Dot {
         return withUnsafeTemporaryAllocation(of: Int8.self, capacity: 256) { w8b in
             withUnsafeTemporaryAllocation(of: Float.self, capacity: 32) { scb in
                 let w8 = w8b.baseAddress!, sw = scb.baseAddress!, mw = sw + 16
-                var acc: Float = 0, accB: Float = 0
-                var m: Float = 0
+                var acc: Float = 0, accB: Float = 0, m: Float = 0
                 let hasMin = IntegerForm.hasMin(type)
                 for blk in 0..<(n / bl) {
                     IntegerForm.unpack(type, row + blk * bs, w8, sw, mw)
-                    let base = blk * bl
-                    var g = 0
-                    while g < bl / 16 {
-                        let b32 = (base >> 5) + (g >> 1)
-                        let xb = xq + base + g * 16
-                        let wb = w8 + g * 16
-                        var s0: Int32 = 0, s1: Int32 = 0
-                        for i in 0..<16 { s0 &+= Int32(wb[i]) &* Int32(xb[i]) }
-                        for i in 0..<16 { s1 &+= Int32(wb[16 + i]) &* Int32(xb[16 + i]) }
-                        let v = dx[b32] * (sw[g] * Float(s0) + sw[g + 1] * Float(s1))
-                        if g & 2 == 0 { acc += v } else { accB += v }
-                        if hasMin {
-                            let g16 = (base >> 4) + g
-                            // upstream's explicit fmaf: fmaf(dx, fmaf(mw0, xs0, mw1 * xs1), m)
-                            let inner = (mw[g + 1] * Float(xs[g16 + 1])).addingProduct(mw[g], Float(xs[g16]))
-                            m = m.addingProduct(dx[b32], inner)
-                        }
-                        g += 2
-                    }
+                    accumulateBlock(w8, sw, mw, base: blk * bl, bl: bl, hasMin: hasMin, xq, dx, xs, &acc, &accB, &m)
                 }
                 return (acc + accB) - m
             }
+        }
+    }
+
+    /// Unpacks a whole row of a non-Q8_0 block type for `dotQ8Unpacked`, so a batch of
+    /// activation rows pays for the unpack once: `w8` gets `cols` codes, `sw` and `mw`
+    /// `cols / 16` scales and mins (block `b`'s at `b * blockSize / 16`).
+    public static func unpackRowQ8(_ type: GGMLType, row: UnsafeRawPointer, cols: Int, w8: UnsafeMutablePointer<Int8>,
+                                   sw: UnsafeMutablePointer<Float>, mw: UnsafeMutablePointer<Float>) {
+        let bl = type.blockSize, bs = type.typeSize, nu = bl / 16
+        for blk in 0..<(cols / bl) {
+            IntegerForm.unpack(type, row + blk * bs, w8 + blk * bl, sw + blk * nu, mw + blk * nu)
+        }
+    }
+
+    /// `dotQ8` of a row unpacked by `unpackRowQ8`: the same sums in the same order, so the
+    /// same bits.
+    public static func dotQ8Unpacked(_ type: GGMLType, w8: UnsafePointer<Int8>, sw: UnsafePointer<Float>,
+                                     mw: UnsafePointer<Float>, _ act: Q8Activations, row r: Int) -> Float {
+        let (xq, dx, xs) = act.row(r)
+        let bl = type.blockSize, nu = bl / 16
+        var acc: Float = 0, accB: Float = 0, m: Float = 0
+        let hasMin = IntegerForm.hasMin(type)
+        for blk in 0..<(act.cols / bl) {
+            accumulateBlock(w8 + blk * bl, sw + blk * nu, mw + blk * nu, base: blk * bl, bl: bl, hasMin: hasMin,
+                            xq, dx, xs, &acc, &accB, &m)
+        }
+        return (acc + accB) - m
+    }
+
+    /// One block of `gq_dot_i8`: integer sums per 16 codes, scaled per 32 activations,
+    /// alternating accumulators, and the min term with upstream's fmaf nesting.
+    @inline(__always)
+    static func accumulateBlock(_ w8: UnsafePointer<Int8>, _ sw: UnsafePointer<Float>, _ mw: UnsafePointer<Float>,
+                                base: Int, bl: Int, hasMin: Bool, _ xq: UnsafePointer<Int8>, _ dx: UnsafePointer<Float>,
+                                _ xs: UnsafePointer<Int32>, _ acc: inout Float, _ accB: inout Float, _ m: inout Float) {
+        var g = 0
+        while g < bl / 16 {
+            let b32 = (base >> 5) + (g >> 1)
+            let xb = xq + base + g * 16
+            let wb = w8 + g * 16
+            var s0: Int32 = 0, s1: Int32 = 0
+            colibri_dot_i8_16x2(wb, xb, &s0, &s1)  // NEON sdot; exact, so order-free
+            let v = dx[b32] * (sw[g] * Float(s0) + sw[g + 1] * Float(s1))
+            if g & 2 == 0 { acc += v } else { accB += v }
+            if hasMin {
+                let g16 = (base >> 4) + g
+                // upstream's explicit fmaf: fmaf(dx, fmaf(mw0, xs0, mw1 * xs1), m)
+                let inner = (mw[g + 1] * Float(xs[g16 + 1])).addingProduct(mw[g], Float(xs[g16]))
+                m = m.addingProduct(dx[b32], inner)
+            }
+            g += 2
         }
     }
 
