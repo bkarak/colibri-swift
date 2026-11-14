@@ -140,6 +140,73 @@ import ColibriMetal
         }
     }
 
+    /// The routed tiled path (GPU grouping + tiled kernel): enough pairs to take it, a
+    /// matrix of 100 rows (a partial 64-row tile), and one hot matrix with more pairs than
+    /// the parallel token tiles cover (the kernel loops), shared and per-pair inputs.
+    @Test(arguments: metalWeightTypes)
+    func tiledExpertsMatchCPU(_ type: GGMLType) throws {
+        let count = 6, rows = 100, cols = 512
+        var rng = TestRNG(UInt64(type.rawValue) + 800)
+        let rb = type.rowBytes(cols)
+        let stride = alignUp(rb * rows + 100, 2)
+        let leading = 64
+        var bytes = [UInt8](repeating: 0, count: stride * count)
+        for e in 0..<count {
+            let m = try Quantize.encode(rng.floats(rows * cols), as: type)
+            bytes.replaceSubrange(e * stride ..< e * stride + m.count, with: m)
+        }
+        let region = makeRegion(bytes, leading: leading)
+        for (tokens, perRow, shared, scales) in [(100, 4, true, nil as [Float]?), (400, 1, false, [0.5, 1, 2, -1, 1.5, 0.25] as [Float]?)] {
+            let stack = StackedWeights(region: region, baseOffset: leading, stride: stride, count: count,
+                                       type: type, cols: cols, rows: rows, scales: scales)
+            let pairs = tokens * perRow
+            #expect(pairs >= twin.metal.tiledExpertMinPairs)
+            // 80% of the pairs go to matrix 2.
+            let ids: [Int32] = (0..<pairs).map { _ in rng.int(10) < 8 ? 2 : Int32(rng.int(count)) }
+            let x = rng.floats((shared ? tokens : pairs) * cols)
+            let (c, m) = try twin.both { b -> () -> [Float] in
+                let xb = try b.upload(x), ib = try b.uploadI32(ids), yb = try b.zeros(pairs * rows)
+                b.matmulExperts(stack, indices: ib.slice(), rows: tokens, perRow: perRow, xb.slice(), sharedInput: shared, into: yb.slice())
+                return { yb.f }
+            }
+            var mag = [Float](repeating: 0, count: pairs * rows)
+            var deq: [Int: [Float]] = [:]
+            for p in 0..<pairs {
+                let e = Int(ids[p])
+                let w = deq[e] ?? dequantRows(type, Array(bytes[e * stride ..< e * stride + rb * rows]), rows: rows, cols: cols)
+                deq[e] = w
+                let xr = shared ? p / perRow : p
+                let mm = Self.magnitudes(w, rows: rows, cols: cols, rowOffset: 0, viewRows: rows,
+                                         Array(x[xr * cols ..< (xr + 1) * cols]), batch: 1, scale: scales?[e] ?? 1)
+                for o in 0..<rows { mag[p * rows + o] = mm[o] }
+            }
+            expectClose(c, m, rel: 3e-5, abs: 1e-6, scale: mag, "\(type) tiled matmulExperts shared \(shared)")
+        }
+    }
+
+    /// Out-of-range ids on the routed tiled path give NaN rows; the others are computed.
+    @Test func tiledExpertsMarkBadIndices() throws {
+        let count = 4, rows = 64, cols = 256, pairs = 400
+        var rng = TestRNG(4242)
+        let bytes = try Quantize.encode(rng.floats(count * rows * cols), as: .q8_0)
+        let stack = StackedWeights(region: makeRegion(bytes), baseOffset: 0, stride: GGMLType.q8_0.rowBytes(cols) * rows,
+                                   count: count, type: .q8_0, cols: cols, rows: rows)
+        var ids: [Int32] = (0..<pairs).map { _ in Int32(rng.int(count)) }
+        ids[7] = 4; ids[150] = -1
+        let x = rng.floats(pairs * cols)
+        let b = twin.metal
+        let xb = try b.upload(x), ib = try b.uploadI32(ids), yb = try b.zeros(pairs * rows)
+        b.matmulExperts(stack, indices: ib.slice(), rows: pairs, perRow: 1, xb.slice(), sharedInput: false, into: yb.slice())
+        try b.synchronize()
+        let y = yb.f
+        for p in [7, 150] {
+            let allNaN = y[p * rows ..< (p + 1) * rows].allSatisfy { $0.isNaN }
+            #expect(allNaN, "pair \(p)")
+        }
+        let finite = y[0 ..< rows].allSatisfy { $0.isFinite } && y[8 * rows ..< 9 * rows].allSatisfy { $0.isFinite }
+        #expect(finite)
+    }
+
     @Test(arguments: metalWeightTypes)
     func embedMatchesCPU(_ type: GGMLType) throws {
         let rows = 20, cols = 256

@@ -167,12 +167,12 @@ but `--batch 64` (the default then) and 2 runs:
 
 | backend, experts | prefill tok/s | decode tok/s |
 |---|---|---|
-| Metal, resident (zero-copy, 16.35 GiB of experts) | 222 | 84 |
+| Metal, resident (zero-copy, 16.35 GiB of experts) | 861 (222 before the tiled kernels) | 84 |
 | CPU, resident | 32 | 10.7 |
 | Metal, streamed through an 8 / 4 / 2 GB cache, `--direct` (128 tokens of `generate`) | | 29.9 / 27.0 / 25.4 |
 
 OLMoE-1B-7B-0125-Instruct Q4_K_M (3.9 GiB, 1.3B active parameters per token), same settings:
-Metal 640 tok/s prefill and 231 tok/s decode, CPU 81 and 28.9.
+Metal 2840 tok/s prefill (640 before the tiled kernels) and 219 tok/s decode, CPU 81 and 28.9.
 
 Qwen3-4B Q4_K_M (2.3 GiB, dense, 4B parameters per token), same settings, 3 runs:
 
@@ -207,9 +207,9 @@ after 512 tokens of context):
 | Qwen3-30B-A3B Q4_K_M | 1660 / 226 (7.3x) | 128 / 81 (1.6x) | 210 / 35.2 (6.0x) | 69.3 / 11.3 (6.1x) |
 
 llama.cpp is 1.35-1.6x faster at Metal decode, 5-7x at Metal prefill and 5-7x on the CPU.
-Since then a tiled prefill kernel and a default `--batch` of 512 brought the dense models'
-Metal prefill to 5237 (Qwen3-0.6B) and 951 tok/s (Qwen3-4B), within 2x of llama.cpp; the
-MoE models' prefill is unchanged.
+Since then, tiled prefill kernels (dense and routed) and a default `--batch` of 512 brought
+Metal prefill to 5219 (Qwen3-0.6B), 980 (Qwen3-4B), 2840 (OLMoE) and 861 tok/s
+(Qwen3-30B-A3B): within 2x of llama.cpp on all four.
 Method and where the gap comes from: `docs/port/status.md` section 3.
 
 ## Adding a model family

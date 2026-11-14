@@ -97,7 +97,8 @@ Before the split-KV attention kernel (one threadgroup per head) these were 110 t
 512 tokens and 70 after 2048. During decode the GPU is busy about 93% of the wall time, so
 the remaining cost is in the kernels, not in host round trips.
 
-OLMoE-1B-7B-0125-Instruct Q4_K_M, same settings: Metal 640 tok/s prefill, 231 decode; CPU
+OLMoE-1B-7B-0125-Instruct Q4_K_M, same settings: Metal 640 tok/s prefill (2840 with the tiled
+kernels, below), 231 decode; CPU
 81 and 28.9. A two-turn chat on Metal reused all 139 tokens of turn 1 from the KV cache.
 
 Qwen3-4B Q4_K_M (2.3 GiB, dense), same settings, median of 3: Metal 279 tok/s prefill, 87
@@ -169,14 +170,32 @@ to 512 with it, since longer chunks now pay off. 512-token prompt, prefill tok/s
 |---|---|---|---|---|
 | Qwen3-0.6B Q8_0 | 2018 | 2504 | 5237 | 10712 |
 | Qwen3-4B Q4_K_M | 281 | 675 | 951 | 1625 |
-| OLMoE-1B-7B-0125-Instruct Q4_K_M | 619 | | 618 | 4080 |
-| Qwen3-30B-A3B Q4_K_M | 213 | | 227 | 1660 |
+| OLMoE-1B-7B-0125-Instruct Q4_K_M | 619 | | 618; with the routed tiled kernel 2840 | 4080 |
+| Qwen3-30B-A3B Q4_K_M | 213 | | 227; with the routed tiled kernel 861 | 1660 |
 
-The MoE models gain nothing yet: their time is in the routed expert matmuls
-(`matmul_id_*`, one token per pair), which a tiled routed kernel (llama.cpp's
-`mul_mm_id`, grouping each expert's tokens) would address. A version that decodes two
-units per step (64-wide K, 24 KB of threadgroup memory) was 5-7% slower: fewer
-threadgroups fit on a core.
+A version that decodes two units per step (64-wide K, 24 KB of threadgroup memory) was
+5-7% slower: fewer threadgroups fit on a core.
+
+**Routed (expert) matmuls.** With 320 or more (token, expert) pairs, `matmulExperts`
+encodes two dispatches (llama.cpp's `mul_mm_id` scheme). `k_group_pairs` (one simdgroup
+per matrix) lists, in pair order, the pairs routed to each matrix, on the GPU, so the
+routing ids never go to the host. Ids out of range get NaN output rows, as before.
+`matmul_id_tiled_<type>` then runs the same 64 x 32 f32 tiles over each matrix's pairs.
+The grid is (row tiles, token tiles, matrices), and a matrix with more pairs than its
+parallel token tiles loops over them. Below about 256 pairs (two to four tokens per
+matrix) the per-pair matvec kernel is faster, so the threshold is 320.
+
+Checked:
+- **Against the CPU:** every weight type, with a matrix taking 80% of the pairs and NaN
+  rows for bad ids (`MetalBackendTests`).
+- **Against upstream:** the oracle comparison with both tiled kernels forced on every
+  prompt is 84/84, plus every streamed case (tiny MoE models at 0.001 GB, OLMoE at
+  0.5 GB, Qwen3-30B-A3B at 2 GB).
+- **Long prompts:** Metal equals the CPU on a 520-token OLMoE prompt and a 693-token
+  Qwen3-30B-A3B prompt, 40 tokens each.
+
+Prefill, 512-token prompt: OLMoE 618 -> 2840 tok/s, Qwen3-30B-A3B 227 -> 861. Both are
+now within 2x of llama.cpp (4080 and 1660).
 
 ## 4. Known gaps
 

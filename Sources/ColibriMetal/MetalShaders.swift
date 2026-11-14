@@ -22,7 +22,8 @@
 //   of each matmul variant (see INSTANTIATE), ATT_NSG for attention.
 // * Kernel names: `matmul_<type>_1` (decode, R = 1), `matmul_<type>_1w` (decode, R = 2),
 //   `matmul_<type>_8` (small prefill batches), `matmul_tiled_<type>` (prefill batches of
-//   `MetalBackend.tiledMinBatch` or more), `matmul_id_<type>`, `embed_<type>`, with <type> the
+//   `MetalBackend.tiledMinBatch` or more), `matmul_id_<type>` (and `matmul_id_tiled_<type>`
+//   after `group_pairs` for routed prefill), `embed_<type>`, with <type> the
 //   lower-cased ggml name (`q8_0`, `q4_k`, ...). MetalBackend looks them up by name.
 
 enum MetalShaders {
@@ -413,6 +414,111 @@ kernel void k_matmul_id(device const uchar *W     [[buffer(0)]],
     }
 }
 
+// Routed prefill, step 1 (llama.cpp's mul_mm_id grouping): one simdgroup per matrix e
+// writes the pairs routed to e, in pair order, to list[e * cap ...] and their number to
+// counts[e]. Simdgroup e == count handles out-of-range ids: their output rows become NaN
+// (as k_matmul_id does), so a bad index stays loud. Grid count + 1, 32 threads.
+struct GroupParams { uint pairs, count, cap, rows; };
+
+kernel void k_group_pairs(device const int *ids    [[buffer(0)]],
+                          device uint *counts      [[buffer(1)]],
+                          device int *list         [[buffer(2)]],
+                          device float *Y          [[buffer(3)]],
+                          constant GroupParams &p  [[buffer(4)]],
+                          uint e                   [[threadgroup_position_in_grid]],
+                          ushort lane              [[thread_index_in_simdgroup]]) {
+    uint base = 0;
+    for (uint p0 = 0; p0 < p.pairs; p0 += 32) {
+        const uint q = p0 + lane;
+        const bool valid = q < p.pairs;
+        const int id = valid ? ids[q] : 0;
+        const bool bad = valid && (id < 0 || (uint)id >= p.count);
+        if (e < p.count) {
+            const uint hit = (valid && !bad && (uint)id == e) ? 1u : 0u;
+            const uint off = simd_prefix_exclusive_sum(hit);
+            if (hit) list[(ulong)e * p.cap + base + off] = (int)q;
+            base += simd_sum(hit);
+        } else if (bad) {
+            for (uint r = 0; r < p.rows; ++r) Y[(ulong)q * p.rows + r] = NAN;
+        }
+    }
+    if (e < p.count && lane == 0) counts[e] = base;
+}
+
+// Routed prefill, step 2: k_matmul_tiled over each matrix's list of pairs. Threadgroup
+// (x, y, e) computes rows x * 64 ..< +64 of matrix e for token tiles y, y + tilesY, ...
+// of e's pairs (tile = 32 pairs), reading input row pair / perRow (sharedInput) or pair,
+// writing output row pair. Same f32 tiles and simdgroup products as k_matmul_tiled.
+// Grid (ceil(rows / 64), tilesY, count), 128 threads.
+struct MMTIdParams {
+    ulong rowBytes, stride, wDelta;
+    uint cols, rows, perRow, sharedInput, count, hasScales, cap, tilesY;
+};
+
+template<typename DQ>
+kernel void k_matmul_id_tiled(device const uchar *W     [[buffer(0)]],
+                              device const float *X     [[buffer(1)]],
+                              device float *Y           [[buffer(2)]],
+                              device const uint *counts [[buffer(3)]],
+                              device const int *list    [[buffer(4)]],
+                              device const float *scales [[buffer(5)]],
+                              constant MMTIdParams &p   [[buffer(6)]],
+                              uint3 tg                  [[threadgroup_position_in_grid]],
+                              ushort tid                [[thread_index_in_threadgroup]],
+                              ushort sg                 [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float sa[MMT_BM * 32];
+    threadgroup float sb[MMT_BN * 32];
+    threadgroup int tp[MMT_BN];          // the tile's pair indices (-1 past the list)
+    const uint e = tg.z, n = counts[e];
+    const uint row0 = tg.x * MMT_BM;
+    if (tg.y * MMT_BN >= n) return;
+    const float scale = p.hasScales ? scales[e] : 1.0f;
+    const uint lr = tid >> 1, lj = (tid & 1) * 4;
+    device const uchar *wrow = W + p.wDelta + (ulong)e * p.stride + (ulong)min(row0 + lr, p.rows - 1) * p.rowBytes;
+    const uint xs = tid >> 2, xj = (tid & 3) * 2;
+    const uint sr = (sg & 1) * 32, st = (sg >> 1) * 16;
+    const uint nunits = p.cols / 32;
+    device const int *mine = list + (ulong)e * p.cap;
+    for (uint t0 = tg.y * MMT_BN; t0 < n; t0 += p.tilesY * MMT_BN) {
+        if (tid < MMT_BN) tp[tid] = t0 + tid < n ? mine[t0 + tid] : -1;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const int pr = tp[xs];
+        const bool xin = pr >= 0;
+        device const float *xrow = X + (ulong)(xin ? (p.sharedInput ? (uint)pr / p.perRow : (uint)pr) : 0) * p.cols;
+        simdgroup_float8x8 acc[4][2];
+        for (int i = 0; i < 4; ++i) for (int j = 0; j < 2; ++j) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (uint u = 0; u < nunits; ++u) {
+            DQ q(wrow, u);
+            for (uint jj = 0; jj < 4; ++jj) {
+                *(threadgroup float4 *)(sa + lr * 32 + 4 * (lj + jj)) = q.get(lj + jj);
+            }
+            for (uint jj = 0; jj < 2; ++jj) {
+                float4 v = xin ? float4(*(device const packed_float4 *)(xrow + u * 32 + 4 * (xj + jj))) : float4(0.0f);
+                *(threadgroup float4 *)(sb + xs * 32 + 4 * (xj + jj)) = v;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint k = 0; k < 32; k += 8) {
+                simdgroup_float8x8 a[4], b[2];
+                for (int i = 0; i < 4; ++i) simdgroup_load(a[i], sa + (sr + 8 * i) * 32 + k, 32);
+                for (int j = 0; j < 2; ++j) simdgroup_load(b[j], sb + (st + 8 * j) * 32 + k, 32, ulong2(0, 0), true);
+                for (int i = 0; i < 4; ++i)
+                    for (int j = 0; j < 2; ++j) simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        for (int i = 0; i < 4; ++i)
+            for (int j = 0; j < 2; ++j)
+                simdgroup_store(acc[i][j], sa + (st + 8 * j) * MMT_BM + sr + 8 * i, MMT_BM, ulong2(0, 0), true);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint x = tid; x < MMT_BM * MMT_BN; x += 128) {
+            const uint s = x / MMT_BM, r = x % MMT_BM;
+            const int ps = tp[s];
+            if (ps >= 0 && row0 + r < p.rows) Y[(ulong)ps * p.rows + row0 + r] = scale * sa[x];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 struct EmbedParams {
     ulong rowBytes;
     ulong wDelta;
@@ -441,6 +547,7 @@ typedef decltype(k_matmul<DQ_Q8_0, 1, 4, 4>) matmul_t;
 typedef decltype(k_matmul_id<DQ_Q8_0, 4>) matmul_id_t;
 typedef decltype(k_embed<DQ_Q8_0>) embed_t;
 typedef decltype(k_matmul_tiled<DQ_Q8_0>) matmul_tiled_t;
+typedef decltype(k_matmul_id_tiled<DQ_Q8_0>) matmul_id_tiled_t;
 
 // Per type: L = lanes per 32-weight unit. Decode uses R = 1 row per simdgroup ("_1",
 // more threadgroups for the 768..4096-row matrices of a layer) or R = 2 ("_1w", for
@@ -453,6 +560,7 @@ template [[host_name("matmul_" #NAME "_1w")]] kernel matmul_t k_matmul<DQ, 1, 2,
 template [[host_name("matmul_" #NAME "_8")]] kernel matmul_t k_matmul<DQ, 8, 2, L>; \
 template [[host_name("matmul_tiled_" #NAME)]] kernel matmul_tiled_t k_matmul_tiled<DQ>; \
 template [[host_name("matmul_id_" #NAME)]] kernel matmul_id_t k_matmul_id<DQ, L>; \
+template [[host_name("matmul_id_tiled_" #NAME)]] kernel matmul_id_tiled_t k_matmul_id_tiled<DQ>; \
 template [[host_name("embed_" #NAME)]] kernel embed_t k_embed<DQ>;
 
 INSTANTIATE(f32, DQ_F32, 2)

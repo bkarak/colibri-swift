@@ -37,6 +37,15 @@ public final class MetalBackend: Backend {
     /// kernel (`matmul_tiled_*`); smaller batches use the matvec kernels. `Int.max` turns
     /// it off (tests compare the two). `COLIBRI_TILED_MIN_BATCH` overrides the default.
     public var tiledMinBatch: Int = ProcessInfo.processInfo.environment["COLIBRI_TILED_MIN_BATCH"].flatMap(Int.init) ?? 20
+    /// Routed (expert) matmuls with at least this many pairs group the pairs by matrix on
+    /// the GPU and use the tiled kernel (`group_pairs` + `matmul_id_tiled_*`); fewer use
+    /// the per-pair matvec kernel. `Int.max` turns it off. `COLIBRI_TILED_EXPERT_MIN_PAIRS`
+    /// overrides the default.
+    public var tiledExpertMinPairs: Int = ProcessInfo.processInfo.environment["COLIBRI_TILED_EXPERT_MIN_PAIRS"].flatMap(Int.init) ?? 320
+    /// Scratch for the routed grouping: per-matrix pair counts and lists (GPU only, grown
+    /// on demand; earlier command buffers keep the buffers they were encoded with).
+    private var groupCounts: MTLBuffer?
+    private var groupList: MTLBuffer?
     /// Number of command buffers committed since the backend was created.
     public private(set) var batchesCommitted = 0
 
@@ -391,6 +400,10 @@ public final class MetalBackend: Backend {
     private struct MMIdParams { var rowBytes: UInt64; var stride: UInt64; var wDelta: UInt64
                                 var cols: UInt32; var rows: UInt32; var perRow: UInt32; var sharedInput: UInt32
                                 var count: UInt32; var hasScales: UInt32 }
+    private struct GroupParams { var pairs: UInt32; var count: UInt32; var cap: UInt32; var rows: UInt32 }
+    private struct MMTIdParams { var rowBytes: UInt64; var stride: UInt64; var wDelta: UInt64
+                                 var cols: UInt32; var rows: UInt32; var perRow: UInt32; var sharedInput: UInt32
+                                 var count: UInt32; var hasScales: UInt32; var cap: UInt32; var tilesY: UInt32 }
     private struct EmbedParams { var rowBytes: UInt64; var wDelta: UInt64; var cols: UInt32; var rows: UInt32
                                  var ntok: UInt32; var scale: Float }
     private struct NormParams { var dim: UInt32; var eps: Float }
@@ -487,6 +500,10 @@ public final class MetalBackend: Backend {
                      "matmulExperts: stack outside its region")
         checkWeightAlignment(w.type, w.baseOffset, w.stride, op: "matmulExperts")
         if let s = w.scales { require(s.count >= w.count, "matmulExperts: \(s.count) scales for \(w.count) matrices") }
+        if pairs >= tiledExpertMinPairs {
+            encodeTiledExperts(w, indices: indices, pairs: pairs, perRow: perRow, x, sharedInput: sharedInput, into: y)
+            return
+        }
         let rowsPerGroup = MetalBackend.mmSimdgroups   // one row per simdgroup
         let p = kernel("matmul_id_" + MetalBackend.kernelSuffix(w.type))
         let e = compute
@@ -503,6 +520,52 @@ public final class MetalBackend: Backend {
                                 hasScales: w.scales == nil ? 0 : 1), index: 5)
         e.dispatchThreadgroups(MTLSize(width: (w.rows + rowsPerGroup - 1) / rowsPerGroup, height: pairs, depth: 1),
                                threadsPerThreadgroup: MTLSize(width: 32 * MetalBackend.mmSimdgroups, height: 1, depth: 1))
+    }
+
+    /// Routed prefill: groups the pairs by matrix on the GPU (`k_group_pairs`), then runs
+    /// the tiled kernel over each matrix's pairs (`matmul_id_tiled_*`). Bad indices give
+    /// NaN rows, as in the matvec kernel.
+    private func encodeTiledExperts(_ w: StackedWeights, indices: BufferSlice, pairs: Int, perRow: Int,
+                                    _ x: BufferSlice, sharedInput: Bool, into y: BufferSlice) {
+        let count = w.count, cap = pairs
+        func scratch(_ b: inout MTLBuffer?, _ bytes: Int, _ label: String) -> MTLBuffer {
+            if let cur = b, cur.length >= bytes { return cur }
+            guard let nb = device.makeBuffer(length: max(bytes, 4096), options: .storageModePrivate) else {
+                fatalError("metal: cannot allocate \(bytes) bytes for \(label)")
+            }
+            nb.label = label
+            b = nb
+            return nb
+        }
+        let counts = scratch(&groupCounts, (count + 1) * 4, "group counts")
+        let list = scratch(&groupList, count * cap * 4, "group lists")
+        let e = compute
+        e.setComputePipelineState(kernel("k_group_pairs"))
+        bind(e, indices, 0)
+        e.setBuffer(counts, offset: 0, index: 1)
+        e.setBuffer(list, offset: 0, index: 2)
+        bind(e, y, 3)
+        setParams(e, GroupParams(pairs: UInt32(pairs), count: UInt32(count), cap: UInt32(cap), rows: UInt32(w.rows)), index: 4)
+        e.dispatchThreadgroups(MTLSize(width: count + 1, height: 1, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+
+        e.setComputePipelineState(kernel("matmul_id_tiled_" + MetalBackend.kernelSuffix(w.type)))
+        let delta = bindWeights(e, w.region, offset: w.baseOffset,
+                                length: (w.count - 1) * w.stride + w.type.rowBytes(w.cols) * w.rows, index: 0)
+        bind(e, x, 1)
+        bind(e, y, 2)
+        e.setBuffer(counts, offset: 0, index: 3)
+        e.setBuffer(list, offset: 0, index: 4)
+        bindBytes(e, w.scales ?? [], index: 5)
+        // Token tiles per matrix run in parallel; a matrix with more pairs loops over them.
+        let average = (pairs + count - 1) / count
+        let tilesY = max(1, min((pairs + 31) / 32, (4 * average + 31) / 32))
+        setParams(e, MMTIdParams(rowBytes: UInt64(w.type.rowBytes(w.cols)), stride: UInt64(w.stride), wDelta: delta,
+                                 cols: UInt32(w.cols), rows: UInt32(w.rows), perRow: UInt32(perRow),
+                                 sharedInput: sharedInput ? 1 : 0, count: UInt32(count),
+                                 hasScales: w.scales == nil ? 0 : 1, cap: UInt32(cap), tilesY: UInt32(tilesY)), index: 6)
+        e.dispatchThreadgroups(MTLSize(width: (w.rows + 63) / 64, height: tilesY, depth: count),
+                               threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
     }
 
     /// An F32 view of a norm weight: the region itself when it is F32 and 4-byte aligned,
