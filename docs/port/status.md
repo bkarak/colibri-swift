@@ -103,11 +103,18 @@ evict pages already cached, and the whole file was. A disk-bound measurement nee
 **OLMoE not run on real weights.** `qwen3moe` has been run on the real Qwen3-30B-A3B
 (section 2); `olmoe` is verified only on synthetic GGUFs that use the real tensor layout.
 
-**First prompt on Metal.** The first forward of a process takes about 2 s longer on
-Qwen3-30B-A3B (0.1 s on Qwen3-0.6B), also when the experts are streamed. Most likely the
-GPU's first touch of the whole-file buffer (17 GB); not profiled. A residency set
-(`MTLResidencySet`, upstream `COLI_METAL_RESSET`) at load, or wrapping only the dense
-ranges when experts stream, would move or remove it.
+**First prompt on Metal (fixed).** The first forward of a process used to wait about
+1.6 s on Qwen3-30B-A3B (7 s with part of the file out of the page cache) before the GPU
+started: the GPU's 0.07 s of work sat behind making the whole-file buffer resident. Two
+causes, both fixed: the file was mapped `MAP_PRIVATE` (1.3-1.7 s to make 17 GB resident,
+against 0.17 s for `MAP_SHARED`), and the whole file was one buffer, so even with
+streamed experts every expert page was read in and made resident. The mapping is now
+`MAP_SHARED` and Metal wraps one page-aligned window per tensor on first use
+(`MetalBackend.weightBuffer`), so streamed expert tensors are never wrapped
+(`MetalSupportTests.fileMappingIsWrappedPerTensor`). First prompt on Qwen3-30B-A3B, warm
+file cache: 0.27 s for 19 tokens (was 2.2 s); with `--expert-cache-gb 2` the first
+command buffer waits 0.01 s (was 1.7 s). What remains with resident experts (about 0.16 s)
+is the GPU mapping 16 GB of experts it really uses.
 
 **Free memory differs from upstream on purpose.** `MemoryBudget.availableBytes` is
 physical memory minus anonymous, wired and compressed pages (Activity Monitor's "memory
@@ -129,11 +136,9 @@ accumulation order differs. 10 of 64 synthetic cases diverge from upstream's
 int8 greedy ids (for example `qwen3_q4_K_M` prompt 2 at step 0, where upstream's own int8
 top-2 gap is 0.0026); Qwen3-0.6B matches on all 5 prompts.
 
-**Metal and files larger than one buffer.** The Metal backend wraps the whole model
-mapping as one buffer, so a file larger than `maxBufferLength` (41.7 GB here) cannot load
-on Metal; with `--backend auto` the CLI then falls back to the CPU. Qwen3-30B-A3B up to
-Q8_0 (about 32 GB) fits. Larger files need the mapping split into overlapping views
-(`TODO(E)` in `MetalBackend.register`).
+**Metal and large files.** A file mapping is wrapped one tensor at a time, so a file may
+be larger than `maxBufferLength` (41.7 GB here); only a single tensor (a stacked expert
+tensor in resident mode) must fit in one buffer. No file over 41.7 GB has been run.
 
 **Expert streaming features present but not wired.** `ExpertStore.prefetch` exists but no
 family calls it (upstream's PILOT router lookahead); live repinning (`repinEvery`, upstream

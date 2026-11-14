@@ -4,7 +4,9 @@ import Metal
 
 /// The Metal backend. One device, one queue, pipelines compiled once from
 /// `MetalShaders.source`. Weight regions are wrapped zero-copy with
-/// `makeBuffer(bytesNoCopy:)`; activation buffers and the KV cache are `.storageModeShared`.
+/// `makeBuffer(bytesNoCopy:)`: an expert arena as one buffer, a file mapping as one
+/// page-aligned window per tensor the GPU actually reads (see `weightBuffer`).
+/// Activation buffers and the KV cache are `.storageModeShared`.
 /// Ops are encoded into one command buffer per batch, so a whole token (or layer) is one
 /// submit (docs/port/runtime-and-metal.md sections 3 and 6.7). Inside a batch the ops go
 /// into one serial compute encoder, which orders each dispatch after the previous one, so
@@ -14,8 +16,8 @@ import Metal
 /// Limits: matrix ops need `cols % 32 == 0` (every quantised type has 32- or 256-element
 /// blocks; float weights must follow suit) and 2-byte aligned weights (4-byte for F32),
 /// attention needs `headDim % 4 == 0`, `headDim <= 256` and `valueDim <= 256`, `topK`
-/// needs `cols <= 2048`, and a weight region must fit in one `MTLBuffer`
-/// (`maxBufferLength`). `checkSupport(_:)` enforces them when a model loads (it throws, so
+/// needs `cols <= 2048`, and one tensor (or expert arena) must fit in one `MTLBuffer`
+/// (`maxBufferLength`); a file may be larger. `checkSupport(_:)` enforces them when a model loads (it throws, so
 /// `--backend auto` falls back to the CPU); every op checks them again when it is encoded
 /// with `require`, which -Ounchecked does not remove.
 public final class MetalBackend: Backend {
@@ -41,6 +43,18 @@ public final class MetalBackend: Backend {
     /// the same object.
     private struct RegionEntry { weak var region: MemoryRegion?; let buffer: MTLBuffer }
     private var regionBuffers: [ObjectIdentifier: RegionEntry] = [:]
+
+    /// File mappings are not wrapped whole. A buffer makes all of its pages resident for
+    /// the GPU, so wrapping a whole GGUF reads every byte of it into RAM on the first
+    /// command buffer: the routed experts too when they are streamed through arenas,
+    /// which defeats the streaming, and about 0.2 s per 17 GB even with a warm file cache.
+    /// Instead each tensor gets its own page-aligned window the first time it is bound,
+    /// keyed by its byte offset (a tensor is always bound at the same offset).
+    private struct Window { let start: Int; let end: Int; let buffer: MTLBuffer }
+    private struct FileWindows { weak var region: MemoryRegion?; var byOffset: [Int: Window] }
+    private var fileWindows: [ObjectIdentifier: FileWindows] = [:]
+    /// Bytes of file mappings wrapped so far (windows can overlap by a page at their ends).
+    public private(set) var wrappedFileBytes = 0
     private var pipelines: [String: MTLComputePipelineState] = [:]
     private var current: MTLCommandBuffer?
     private var encoder: MTLComputeCommandEncoder?
@@ -128,10 +142,9 @@ public final class MetalBackend: Backend {
         guard Int(bitPattern: region.base) % hostPageSize == 0, region.length % hostPageSize == 0 else {
             throw ColibriError.backend("metal: region \(region.label) is not 16 KiB aligned")
         }
+        // A file mapping is wrapped lazily, tensor by tensor (`weightBuffer`).
+        if region.kind == .fileMapping { return }
         guard region.length <= device.maxBufferLength else {
-            // TODO(E): split into overlapping views (each tensor wholly inside one view).
-            // Not needed for the models in scope: Qwen3-30B-A3B Q8_0 (~32 GB) is below
-            // this machine's 41.7 GB maxBufferLength.
             throw ColibriError.backend("metal: region \(region.label) (\(region.length) bytes) exceeds maxBufferLength \(device.maxBufferLength)")
         }
         guard let buffer = device.makeBuffer(bytesNoCopy: UnsafeMutableRawPointer(mutating: region.base),
@@ -143,8 +156,37 @@ public final class MetalBackend: Backend {
         regionBuffers[region.id] = RegionEntry(region: region, buffer: buffer)
     }
 
-    /// The Metal buffer wrapping `region`, registering it on first use.
+    /// The buffer holding `length` bytes of `region` from `offset`, and the region offset
+    /// of that buffer's first byte. Expert arenas (and other regions) are one buffer
+    /// starting at 0; a file mapping gets a page-aligned window per tensor.
+    public func weightBuffer(_ region: MemoryRegion, offset: Int, length: Int) -> (buffer: MTLBuffer, start: Int) {
+        guard region.kind == .fileMapping else { return (buffer(for: region), 0) }
+        let end = offset + max(length, 1)
+        if let f = fileWindows[region.id], f.region === region, let w = f.byOffset[offset], w.end >= end {
+            return (w.buffer, w.start)
+        }
+        require(offset >= 0 && end <= region.length, "metal: bytes \(offset)..<\(end) outside \(region.label)")
+        let start = offset & ~(hostPageSize - 1)
+        let stop = min(region.length, (end + hostPageSize - 1) & ~(hostPageSize - 1))
+        require(stop - start <= device.maxBufferLength,
+                "metal: a tensor of \(stop - start) bytes in \(region.label) exceeds maxBufferLength \(device.maxBufferLength)")
+        guard let buffer = device.makeBuffer(bytesNoCopy: UnsafeMutableRawPointer(mutating: region.base + start),
+                                             length: stop - start, options: .storageModeShared, deallocator: nil) else {
+            fatalError("metal: cannot wrap bytes \(start)..<\(stop) of \(region.label)")
+        }
+        buffer.label = "\(region.label)@\(offset)"
+        var f = fileWindows[region.id]
+        if f == nil || f!.region !== region { f = FileWindows(region: region, byOffset: [:]) }
+        f!.byOffset[offset] = Window(start: start, end: stop, buffer: buffer)
+        fileWindows[region.id] = f
+        wrappedFileBytes += stop - start
+        return (buffer, start)
+    }
+
+    /// The Metal buffer wrapping all of `region`, registering it on first use. For a file
+    /// mapping this is one window over the whole file; ops use `weightBuffer` instead.
     public func buffer(for region: MemoryRegion) -> MTLBuffer {
+        if region.kind == .fileMapping { return weightBuffer(region, offset: 0, length: region.length).buffer }
         if let e = regionBuffers[region.id], e.region === region { return e.buffer }
         do { try register(region) } catch { fatalError("metal: \(error)") }
         return regionBuffers[region.id]!.buffer
@@ -255,11 +297,12 @@ public final class MetalBackend: Backend {
     /// Binds the region buffer at `offset` rounded down to 256 bytes (setBuffer offsets
     /// must be aligned for the kernel's access type) and returns the remainder, which the
     /// kernel adds to the bound pointer.
-    private func bindWeights(_ e: MTLComputeCommandEncoder, _ region: MemoryRegion, offset: Int, index: Int) -> UInt64 {
-        let buf = buffer(for: region)
-        let aligned = offset & ~255
+    private func bindWeights(_ e: MTLComputeCommandEncoder, _ region: MemoryRegion, offset: Int, length: Int, index: Int) -> UInt64 {
+        let (buf, start) = weightBuffer(region, offset: offset, length: length)
+        let local = offset - start   // start is page-aligned, so 256-byte alignment carries over
+        let aligned = local & ~255
         e.setBuffer(buf, offset: aligned, index: index)
-        return UInt64(offset - aligned)
+        return UInt64(local - aligned)
     }
 
     /// Small constant data inline (`setBytes`, up to 4 KiB), larger data in a fresh buffer
@@ -370,7 +413,7 @@ public final class MetalBackend: Backend {
         let p = kernel("embed_" + MetalBackend.kernelSuffix(table.type))
         let e = compute
         e.setComputePipelineState(p)
-        let delta = bindWeights(e, table.region, offset: table.offset, index: 0)
+        let delta = bindWeights(e, table.region, offset: table.offset, length: table.byteCount, index: 0)
         bindBytes(e, tokens, index: 1)
         bind(e, out, 2)
         setParams(e, EmbedParams(rowBytes: UInt64(table.rowBytes), wDelta: delta, cols: UInt32(table.cols),
@@ -402,7 +445,7 @@ public final class MetalBackend: Backend {
         let p = kernel(name)
         let e = compute
         e.setComputePipelineState(p)
-        let delta = bindWeights(e, w.region, offset: w.offset, index: 0)
+        let delta = bindWeights(e, w.region, offset: w.offset, length: w.byteCount, index: 0)
         bind(e, x, 1)
         bind(e, y, 2)
         setParams(e, MMParams(rowBytes: UInt64(w.rowBytes), wDelta: delta, cols: UInt32(w.cols), rows: UInt32(w.rows),
@@ -431,7 +474,8 @@ public final class MetalBackend: Backend {
         let p = kernel("matmul_id_" + MetalBackend.kernelSuffix(w.type))
         let e = compute
         e.setComputePipelineState(p)
-        let delta = bindWeights(e, w.region, offset: w.baseOffset, index: 0)
+        let delta = bindWeights(e, w.region, offset: w.baseOffset,
+                                length: (w.count - 1) * w.stride + w.type.rowBytes(w.cols) * w.rows, index: 0)
         bind(e, x, 1)
         bind(e, y, 2)
         bind(e, indices, 3)
@@ -448,7 +492,8 @@ public final class MetalBackend: Backend {
     /// otherwise a converted copy made once (norm weights are a few KiB).
     private func normWeight(_ w: WeightView, count: Int) -> (MTLBuffer, Int) {
         if w.type == .f32 && w.offset % 4 == 0 {
-            return (buffer(for: w.region), w.offset)
+            let (b, start) = weightBuffer(w.region, offset: w.offset, length: count * 4)
+            return (b, w.offset - start)
         }
         let key = NormKey(region: w.region.id, offset: w.offset, type: w.type, count: count)
         if w.region.kind != .expertArena, let e = normWeights[key], e.region === w.region { return (e.buffer, 0) }

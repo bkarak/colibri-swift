@@ -371,11 +371,13 @@ each slot, an aligned F_NOCACHE window can be read in place, as in upstream's
 `st_read_range_rep`. Measured alignment costs ~10% for a single thread and
 nothing at depth 8, so v1 can read unaligned and keep the pad for later.
 
-For the resident store, `GPUWeights` maps the whole GGUF once
-(`mmap(PROT_READ, MAP_SHARED)`, length rounded up to 16 KiB) and wraps it with
-`bytesNoCopy`. Files over `maxBufferLength` (41.7 GB here) are split into
-overlapping views, each `maxBufferLength` long and overlapping by the largest
-tensor, so every tensor sits wholly inside one view (llama.cpp does the same).
+For the resident store, the port maps the whole GGUF once
+(`mmap(PROT_READ, MAP_SHARED)`, length rounded up to 16 KiB). *As built:* Metal does not
+wrap the whole mapping; `MetalBackend.weightBuffer` wraps one page-aligned
+`bytesNoCopy` window per tensor the first time a kernel binds it. A buffer is made
+resident whole, so a whole-file buffer read every expert page in on the first command
+buffer even when the experts were streamed; per-tensor windows also make files over
+`maxBufferLength` (41.7 GB here) work, as long as each tensor fits.
 GGUF data offsets are 32-aligned, which satisfies Metal's buffer-offset rule.
 Kernels must not assume 4-byte alignment *inside* a block (Q8_0 is 34 bytes):
 read through `packed_` vector types or byte loads.

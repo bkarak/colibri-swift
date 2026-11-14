@@ -118,7 +118,7 @@ for big MoE files; the reader should be structured so a tensor is (file, absolut
 ### 1.5 Reading tensor bytes
 
 Upstream never maps the file: it `pread`s exactly the byte range it needs (gguf.h:333). For the
-Swift port on macOS, `mmap` of the whole file (PROT_READ, MAP_PRIVATE) is the natural choice for
+Swift port on macOS, `mmap` of the whole file (PROT_READ, MAP_SHARED: a private mapping costs about 1.5 s per 17 GB to make GPU-resident) is the natural choice for
 the resident dense weights; a Metal buffer can wrap a page-aligned mapping with
 `makeBuffer(bytesNoCopy:)` and address tensors by buffer offset. Tensor offsets are only 32-byte
 aligned, not page aligned, so wrap the whole mapping (or page-rounded windows), not individual

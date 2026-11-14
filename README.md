@@ -168,8 +168,8 @@ but the default `--batch 64` and 2 runs:
 The streamed rows were measured with the whole file already in the macOS file cache, so
 the reads came from RAM (24-56 GB/s), not the SSD: `F_NOCACHE` does not drop pages that are
 already cached. For a disk-bound number run `sudo purge` first. The first prompt of a
-process pays about 2 s once on this model (0.1 s on Qwen3-0.6B), most likely the GPU's
-first touch of the whole-file buffer; `bench` warms up first and hides it.
+fresh process takes 0.27 s for 19 tokens on this model; the GPU maps only the tensors it
+reads, so streamed experts are never pulled into memory by the GPU.
 
 With a short prompt Metal decodes Qwen3-0.6B at about 233 tok/s; after a 2048-token prompt, at about
 194. The GPU is busy for about 93% of the wall time during decode. There is no comparison

@@ -20,8 +20,11 @@ final class MappingStorage: @unchecked Sendable {
     }
 }
 
-/// A whole file mapped read-only (`mmap(PROT_READ, MAP_PRIVATE)`), with the mapping
+/// A whole file mapped read-only (`mmap(PROT_READ, MAP_SHARED)`), with the mapping
 /// length rounded up to `hostPageSize` so Metal can wrap it with `bytesNoCopy`.
+/// `MAP_SHARED`, not `MAP_PRIVATE`: the mapping is never written, and making a private
+/// mapping resident for the GPU cost about 1.5 s per 17 GB on the first command buffer
+/// (Qwen3-30B-A3B, file cache warm) against 0.17 s for a shared one.
 /// Dense weights are read through this mapping; routed experts in streaming mode are
 /// read with `pread` instead (see Experts/), so their pages never count against RSS.
 public final class MappedFile: @unchecked Sendable {
@@ -55,7 +58,7 @@ public final class MappedFile: @unchecked Sendable {
         // The kernel zero-fills the tail of the last page; rounding to the 16 KiB VM page
         // never maps a page that lies wholly past the end of the file.
         let length = alignUp(size, hostPageSize)
-        guard let p = mmap(nil, length, PROT_READ, MAP_PRIVATE, fd, 0), p != MAP_FAILED else {
+        guard let p = mmap(nil, length, PROT_READ, MAP_SHARED, fd, 0), p != MAP_FAILED else {
             let e = errno
             close(fd)
             throw ColibriError.io(path: path, operation: "mmap", errno: e)

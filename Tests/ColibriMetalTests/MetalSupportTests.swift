@@ -68,6 +68,36 @@ import ColibriMetal
         try metalExpertReadFailureCheck()
     }
 
+    /// The file mapping is wrapped tensor by tensor: with streamed experts the GPU never
+    /// wraps (and so never makes resident) the routed-expert tensors of the file, and with
+    /// resident experts it does. Wrapping the whole file made a first prompt read every
+    /// expert into RAM even when they were streamed.
+    @Test(arguments: [ExpertStoreOptions.Mode.stream, .resident])
+    func fileMappingIsWrappedPerTensor(_ mode: ExpertStoreOptions.Mode) throws {
+        let spec = TinyModelSpec(architecture: "qwen3moe", weightType: .q8_0, seed: 3)
+        let path = NSTemporaryDirectory() + "colibri-metal-windows-\(UUID().uuidString).gguf"
+        try TinyModel.write(spec, to: path)
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let file = try GGUFFile(path: path)
+        let expertBytes = file.tensors.filter { $0.name.hasSuffix("_exps.weight") }.reduce(0) { $0 + $1.byteCount }
+        let denseBytes = file.tensors.filter { !$0.name.hasSuffix("_exps.weight") }.reduce(0) { $0 + $1.byteCount }
+        let slack = file.tensors.count * 2 * hostPageSize   // a window rounds out to pages at both ends
+        #expect(expertBytes > denseBytes + slack, "the tiny model's experts must dominate for this test to mean anything")
+
+        let metal = try MetalBackend()
+        let opts = ExpertStoreOptions(mode: mode, slotsPerLayer: mode == .stream ? 4 : nil, ioThreads: 2, saveHistory: false)
+        let m = try ModelRegistry.load(path: path, context: LoadContext(backend: metal, expertOptions: opts,
+                                                                        maxContext: 64, maxBatch: 64))
+        let prompt: [Int32] = (0..<24).map { Int32(($0 * 37 + 11) % 200) }
+        _ = try m.model.forward(prompt, state: try m.model.makeState())
+        if mode == .stream {
+            #expect(metal.wrappedFileBytes <= denseBytes + slack,
+                    "streamed: \(metal.wrappedFileBytes) file bytes wrapped, dense tensors are \(denseBytes)")
+        } else {
+            #expect(metal.wrappedFileBytes >= expertBytes)
+        }
+    }
+
     /// Upstream's golden blocks (Tests/ColibriCoreTests/Fixtures/quant) through the Metal
     /// embed and decode matvec. Embed is bit-exact except that Metal's f32 arithmetic
     /// flushes subnormals to zero (only BF16 can decode to one); the matvec agrees with
