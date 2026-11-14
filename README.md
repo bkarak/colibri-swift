@@ -91,7 +91,8 @@ Main options (`coli-swift --help` lists all):
 
 Weight types, on both backends: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K,
 Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS. That covers the common `Q4_K_M`, `Q5_K_M`, `Q6_K` and
-`Q8_0` files. The other i-quants (IQ1_*, IQ2_*, IQ3_*), the ternary and FP4 types are not
+`Q8_0` files. Split models (`<name>-00001-of-0000N.gguf`, as llama.cpp's `gguf-split`
+writes them and as large models are published) open from any shard. The other i-quants (IQ1_*, IQ2_*, IQ3_*), the ternary and FP4 types are not
 decoded yet; such a file is refused at load time, naming the type and the tensors that use
 it. Metal also refuses, at load, shapes its kernels do not handle (attention head dim above
 256 or not a multiple of 4, a matrix row length not a multiple of 32, more than 2048 router

@@ -112,8 +112,17 @@ strings at most 1 GiB. Treat the header as untrusted input and keep these checks
 `NAME-00001-of-0000N.gguf` (five digits each side): each part is a complete GGUF (own header,
 own alignment, own data section). Upstream derives the part list from the file name (part 1
 must be the one named), reads the metadata from part 1 only, and concatenates the tensor tables;
-each tensor remembers its part. The `split.*` keys are ignored. For the port this is only needed
-for big MoE files; the reader should be structured so a tensor is (file, absolute offset, nbytes).
+each tensor remembers its part. The `split.*` keys are ignored.
+
+The port opens a split model from any of its parts (it derives the others from the name,
+llama.cpp's `-%05d-of-%05d.gguf`). `MappedFile(paths:)` reserves one range of address space
+and maps every part into it with `MAP_FIXED`, each at a page boundary, so the parts read as
+one file: a tensor's `fileOffset` is the part's `FileSegment.start` plus its offset in the
+part, and everything above the reader (weight views, Metal's per-tensor `bytesNoCopy`
+windows, the resident expert store) is unchanged. The streaming expert store opens one
+descriptor per part and routes each `pread` by offset; a tensor, so an expert slice, never
+spans parts. Unlike upstream the port checks `split.no` and `split.count` in every part and
+`split.tensors.count` against the parts' tensor tables.
 
 ### 1.5 Reading tensor bytes
 
