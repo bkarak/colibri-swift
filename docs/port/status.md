@@ -32,6 +32,8 @@ DIVERGED with the step.
 |---|---|---|---|
 | Qwen3-0.6B Q8_0, 5 prompts x 32 tokens | CPU | 5/5 | none |
 | Qwen3-0.6B Q8_0, 5 prompts x 32 tokens | Metal | 5/5 | none |
+| Qwen3-4B Q4_K_M (dense, K-quants, tied output), the same 5 prompts x 32 tokens, every step's logits recorded; prefill logits within 5e-5 | CPU, Metal | 5/5, 5/5 | none |
+| same, `--int8` vs upstream's default int8 path | CPU | 5/5 | none |
 | Qwen3-30B-A3B Q4_K_M, the same 5 prompts x 32 tokens (fixture recorded with `record.py --light`: greedy ids and prefill top-20 only; prefill logits within 5e-5) | CPU | 5/5 | none |
 | same | Metal | 5/5 | none |
 | OLMoE-1B-7B-0125-Instruct Q4_K_M, 5 OLMoE-template and raw prompts x 32 tokens; prompt ids from the model's HF `tokenizer.json` (`scripts/oracle/hf_tokenize.py`), which the port's tokenizer matches on all 5; every step's logits recorded; prefill logits within 3e-5 | CPU, Metal | 5/5, 5/5 | none |
@@ -48,7 +50,7 @@ DIVERGED with the step.
 | resident vs streamed experts, 4 synthetic MoE models x 128 tokens | CPU, Metal | identical ids | none |
 | Metal vs CPU, Qwen3-0.6B, 5 prompts x 128 tokens, f32 and f16 KV | | identical ids | none |
 | Metal vs CPU, Qwen3-0.6B, 2654-token prompt x 96 tokens, f32 and f16 KV | | identical ids | none |
-| `--int8` vs upstream's default int8-activation path | CPU | Qwen3-0.6B 5/5; synthetic 54/64 | see section 4 |
+| `--int8` vs upstream's default int8-activation path | CPU | Qwen3-0.6B 5/5, Qwen3-4B 5/5; synthetic 54/64 | see section 4 |
 | upstream's golden quant blocks (14 types) fed straight into the Metal embed and decode matvec (`MetalSupportTests`) | Metal | embed bit-exact for 13 types; BF16: subnormals flushed to 0 (see section 4); matvec within 1e-5 x magnitude of `gq_matmul_f32` | |
 | unsupported shape (synthetic qwen3 with head dim 512), release CLI | Metal / auto | refused at load with the limit named; `--backend auto` loads it on the CPU (finite logits) | |
 | expert read failure (streamed qwen3moe truncated after load, prefill routing to the lost expert) | CPU, Metal | the forward throws (`FailureModeTests`, `MetalSupportTests`) | |
@@ -68,7 +70,7 @@ scripts/oracle/compare.sh --no-build --reference default                 # --int
 and the real-model oracle case are skipped unless enabled) covers, besides the per-module unit tests: every block decoder
 bit for bit against upstream's golden data, the tokenizer against upstream's ids (including
 a fuzz set), prefill logits and greedy ids of three synthetic models against upstream
-(`COLIBRI_ORACLE_FULL=1` for all 16, `COLIBRI_ORACLE_REAL=1` adds Qwen3-0.6B), resident
+(`COLIBRI_ORACLE_FULL=1` for all 16, `COLIBRI_ORACLE_REAL=1` adds the real models present), resident
 against streamed experts byte for byte, every Metal op against the CPU for every weight
 type, upstream's golden blocks through the Metal kernels, whole layers on Metal, real
 Qwen3-0.6B tensors on Metal against the CPU, Qwen3-0.6B's golden prompt (upstream's 16
@@ -96,7 +98,14 @@ Before the split-KV attention kernel (one threadgroup per head) these were 110 t
 the remaining cost is in the kernels, not in host round trips.
 
 OLMoE-1B-7B-0125-Instruct Q4_K_M, same settings: Metal 640 tok/s prefill, 231 decode; CPU
-81 and 28.9. A two-turn chat on Metal reused all 139 tokens of turn 1 from the KV cache.
+81 and 28.9.
+
+Qwen3-4B Q4_K_M (2.3 GiB, dense), same settings, median of 3: Metal 279 tok/s prefill, 87
+decode (f16 KV: 283 and 92); CPU 44.6 and 10.7; CPU `--int8` 13.3 and 9.7 (see section 4).
+Decode reads about 2.5 GB of weights per token, so 87 tok/s is about 215 GB/s, about 40% of
+the M4 Max's 546 GB/s. Prefill uses the decode matvec kernel over groups of tokens, in
+fp32; it has no simdgroup-matrix (tiled matrix-multiply) kernel, which is where llama.cpp's
+prefill speed comes from. A two-turn chat on Metal reused all 139 tokens of turn 1 from the KV cache.
 
 Qwen3-30B-A3B Q4_K_M, 512-token prompt, 128 generated tokens, `--batch 64`, median of 2:
 Metal resident 222 tok/s prefill, 84 decode; CPU resident 32 and 10.7. Streamed on Metal
@@ -107,8 +116,8 @@ evict pages already cached, and the whole file was. A disk-bound measurement nee
 
 ## 4. Known gaps
 
-**Real models run.** One per family: Qwen3-0.6B, Qwen3-30B-A3B and
-OLMoE-1B-7B-0125-Instruct, all against upstream (section 2). Other quantisations of them
+**Real models run.** Qwen3-0.6B and Qwen3-4B (qwen3), Qwen3-30B-A3B (qwen3moe) and
+OLMoE-1B-7B-0125-Instruct (olmoe), all against upstream (section 2). Other quantisations of them
 (only Q8_0 and Q4_K_M files were run) and the 0924 OLMoE release have not been.
 
 **First prompt on Metal (fixed).** The first forward of a process used to wait about
@@ -143,6 +152,13 @@ upstream's codes, scales and integer sums exactly (golden data); only their floa
 accumulation order differs. 10 of 64 synthetic cases diverge from upstream's
 int8 greedy ids (for example `qwen3_q4_K_M` prompt 2 at step 0, where upstream's own int8
 top-2 gap is 0.0026); Qwen3-0.6B matches on all 5 prompts.
+
+**`--int8` prefill is slow on K-quants.** The integer path unpacks a K-quant weight row
+(Q4_K, Q5_K, Q6_K and the other non-Q8_0 types) once per token of the batch, where the
+float path dequantises it once per batch, so on Qwen3-4B Q4_K_M `--int8` prefill runs at
+13 tok/s against the float path's 45. Q8_0 has its own loop and is not affected
+(Qwen3-0.6B: 759 against 345). Unpacking each row once per batch would fix it without
+changing the arithmetic.
 
 **Metal and large files.** A file mapping is wrapped one tensor at a time, so a file may
 be larger than `maxBufferLength` (41.7 GB here); only a single tensor (a stacked expert

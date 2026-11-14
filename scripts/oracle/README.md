@@ -106,7 +106,7 @@ and fails if the generator no longer writes the same bytes.
 In the test suite (`Tests/ColibriCoreTests/OracleTests.swift`, CPU backend through the
 library): fixture sanity, generator fingerprints, tokenizer vs upstream prompt ids, and
 prefill logits (tolerance 2e-3 tiny, 2e-2 top-20 real) plus greedy ids for 3 tiny cases.
-`COLIBRI_ORACLE_FULL=1` runs all 16 tiny cases; `COLIBRI_ORACLE_REAL=1` adds Qwen3-0.6B
+`COLIBRI_ORACLE_FULL=1` runs all 16 tiny cases; `COLIBRI_ORACLE_REAL=1` adds every real model present
 (use a release build: `swift test -c release -Xswiftc -enable-testing --filter OracleTests`).
 
 Through the CLI, any backend:

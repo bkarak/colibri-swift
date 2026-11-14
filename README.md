@@ -98,6 +98,7 @@ it. Metal also refuses, at load, shapes its kernels do not handle (attention hea
 experts); with `--backend auto` such a model runs on the CPU instead.
 
 Each family has been run as a real model against upstream: Qwen3-0.6B (Q8_0, dense),
+Qwen3-4B (Q4_K_M, dense),
 Qwen3-30B-A3B (Q4_K_M, MoE, 128 experts, top 8) and OLMoE-1B-7B-0125-Instruct (Q4_K_M, MoE,
 64 experts, top 8, Allen AI's own GGUF). All three were also verified on small random GGUFs
 written by `Sources/ColibriCore/Synthetic/TinyModel.swift` with the real tensor layout
@@ -113,6 +114,7 @@ runs `coli-swift generate` on every fixture prompt and reports the first diverge
 | check | CPU | Metal |
 |---|---|---|
 | Qwen3-0.6B Q8_0 vs upstream: 5 prompts (chat, raw English, raw Python, Greek with a system message) x 32 tokens | 5/5 match | 5/5 match |
+| Qwen3-4B Q4_K_M vs upstream: the same 5 prompts x 32 tokens, every step's logits (prefill top-20 within 5e-5) | 5/5 match | 5/5 match |
 | Qwen3-30B-A3B Q4_K_M vs upstream: the same 5 prompts x 32 tokens (prefill top-20 logits within 5e-5) | 5/5 match | 5/5 match |
 | OLMoE-1B-7B-0125-Instruct Q4_K_M vs upstream: 5 prompts (its own chat template, raw English, raw Python, Greek with a system message) x 32 tokens; prompt ids from the model's HF tokenizer, which the port matches (prefill top-20 logits within 3e-5) | 5/5 match | 5/5 match |
 | OLMoE with streamed experts, `--expert-cache-gb 0.5` (8 of 64 slots per layer) | 5/5 match | 5/5 match |
@@ -123,7 +125,7 @@ runs `coli-swift generate` on every fixture prompt and reports the first diverge
 | resident vs streamed experts, 4 synthetic MoE models x 128 tokens | identical | identical |
 | Metal vs CPU on Qwen3-0.6B: 5 prompts x 128 tokens, f32 and f16 KV | | identical |
 | Metal vs CPU on Qwen3-0.6B: a 2654-token prompt x 96 tokens, f32 and f16 KV | | identical |
-| `--int8` vs upstream's default int8 path | Qwen3-0.6B 5/5, synthetic 54/64 (see `docs/port/status.md`) | n/a |
+| `--int8` vs upstream's default int8 path | Qwen3-0.6B 5/5, Qwen3-4B 5/5, synthetic 54/64 (see `docs/port/status.md`) | n/a |
 | upstream's golden quant blocks (14 types) through the Metal kernels | | embed bit-exact except BF16 subnormals (flushed to 0); matvec within 1e-5 of magnitude of upstream's `gq_matmul_f32` |
 | a model shape Metal does not support (synthetic qwen3, head dim 512), release build | runs, finite logits | refused at load; `--backend auto` falls back to the CPU |
 | an expert read that fails mid-run (streamed qwen3moe, file truncated after load) | the forward throws | the forward throws |
@@ -131,7 +133,7 @@ runs `coli-swift generate` on every fixture prompt and reports the first diverge
 On top of that, `swift test` checks every block decoder bit for bit against upstream's,
 the tokenizer against upstream's prompt ids, the prefill logits and greedy ids of three
 synthetic models against upstream's (all 16 with `COLIBRI_ORACLE_FULL=1`, Qwen3-0.6B with
-`COLIBRI_ORACLE_REAL=1`, which also runs Qwen3-30B-A3B when its file is present; tolerance 2e-3, typically about 1e-5), resident against streamed
+`COLIBRI_ORACLE_REAL=1`, which also runs Qwen3-4B, Qwen3-30B-A3B and OLMoE when their files are present; tolerance 2e-3, typically about 1e-5), resident against streamed
 experts, every Metal kernel against the CPU backend for every weight type, and the
 failure modes above.
 
@@ -170,6 +172,18 @@ but the default `--batch 64` and 2 runs:
 
 OLMoE-1B-7B-0125-Instruct Q4_K_M (3.9 GiB, 1.3B active parameters per token), same settings:
 Metal 640 tok/s prefill and 231 tok/s decode, CPU 81 and 28.9.
+
+Qwen3-4B Q4_K_M (2.3 GiB, dense, 4B parameters per token), same settings, 3 runs:
+
+| backend | prefill tok/s | decode tok/s |
+|---|---|---|
+| Metal, f32 KV | 279 | 87 |
+| Metal, f16 KV | 283 | 92 |
+| CPU, float path | 44.6 | 10.7 |
+| CPU, `--int8` | 13.3 | 9.7 (slow on K-quants, see `docs/port/status.md`) |
+
+The dense 4B decodes at the speed of the 30B MoE (87 against 84 tok/s): both read about
+the same weight bytes per token.
 
 The streamed rows were measured with the whole file already in the macOS file cache, so
 the reads came from RAM (24-56 GB/s), not the SSD: `F_NOCACHE` does not drop pages that are
