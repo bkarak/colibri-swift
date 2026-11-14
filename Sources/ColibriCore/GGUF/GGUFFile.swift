@@ -12,7 +12,8 @@ public struct GGUFTensorInfo: Sendable, Equatable {
     public var type: GGMLType
     /// Offset relative to the data section, a multiple of the file's alignment.
     public var relativeOffset: Int
-    /// Absolute byte offset in the file (`dataStart + relativeOffset`).
+    /// Byte offset in the model's mapping: `dataStart + relativeOffset` in a single file;
+    /// in a split model, the shard's `FileSegment.start` plus that within the shard.
     public var fileOffset: Int
     /// Computed byte size.
     public var byteCount: Int
@@ -139,17 +140,92 @@ public final class GGUFFile: @unchecked Sendable {
     /// Tensors in file order.
     public let tensors: [GGUFTensorInfo]
     public let alignment: Int
-    /// Absolute offset of the data section.
+    /// Offset of the data section (of the first shard, for a split model).
     public let dataStart: Int
     public let file: MappedFile
 
     private let index: [String: Int]
 
-    /// Opens and parses `path`. Split models (`-00001-of-0000N.gguf`) are a later
-    /// extension; the tensor model (file + absolute offset) already allows them.
+    /// Opens and parses `path`. A split model (`<name>-00001-of-0000N.gguf`, llama.cpp's
+    /// `gguf-split` layout: `split.count` > 1 in every shard) is opened whole from any of
+    /// its shards: every shard is mapped back to back (`MappedFile(paths:)`), metadata comes
+    /// from the first, and tensor offsets are offsets into that combined mapping.
     public init(path: String) throws {
-        let file = try MappedFile(path: path)
-        var r = GGUFByteReader(base: file.base, size: file.fileSize)
+        let first = try MappedFile(path: path)
+        let h0 = try Self.parseHeader(base: first.base, size: first.fileSize, path: path)
+        let count = h0.metadata.int("split.count") ?? 1
+        let file: MappedFile
+        var headers: [Header]
+        if count <= 1 {
+            file = first
+            headers = [h0]
+        } else {
+            let paths = try Self.splitPaths(path: path, count: count)
+            file = try MappedFile(paths: paths)
+            headers = []
+            for (i, seg) in file.segments.enumerated() {
+                let h = try Self.parseHeader(base: file.base + seg.start, size: seg.size, path: seg.path)
+                guard h.metadata.int("split.count") == count, (h.metadata.int("split.no") ?? -1) == i else {
+                    throw ColibriError.invalidGGUF("\(seg.path): split.no \(h.metadata.int("split.no").map(String.init) ?? "missing") / split.count \(h.metadata.int("split.count").map(String.init) ?? "missing"); expected \(i) / \(count)")
+                }
+                headers.append(h)
+            }
+        }
+
+        var tensors = [GGUFTensorInfo]()
+        var index = [String: Int]()
+        for (h, seg) in zip(headers, file.segments) {
+            for t in h.tensors {
+                guard index[t.name] == nil else {
+                    throw ColibriError.invalidGGUF("\(seg.path): duplicate tensor name \(t.name)")
+                }
+                index[t.name] = tensors.count
+                var t = t
+                t.fileOffset += seg.start
+                tensors.append(t)
+            }
+        }
+        let h = headers[0]  // the first shard holds the metadata, whichever shard was opened
+        if count > 1, let expected = h.metadata.int("split.tensors.count"), expected != tensors.count {
+            throw ColibriError.invalidGGUF("\(path): split.tensors.count is \(expected), the \(count) shards hold \(tensors.count)")
+        }
+
+        self.version = h.version
+        self.metadata = h.metadata
+        self.tensors = tensors
+        self.alignment = h.alignment
+        self.dataStart = h.dataStart
+        self.file = file
+        self.index = index
+    }
+
+    /// The shard paths of a split model, from the name of any shard
+    /// (`<prefix>-%05d-of-%05d.gguf`, llama.cpp's `llama_split_path`).
+    static func splitPaths(path: String, count: Int) throws -> [String] {
+        let suffix = String(format: "-of-%05d.gguf", count)
+        guard path.hasSuffix(suffix) else {
+            throw ColibriError.invalidGGUF("\(path) has split.count \(count) but is not named <name>-NNNNN\(suffix)")
+        }
+        let stem = path.dropLast(suffix.count)
+        guard stem.count > 6, stem.suffix(6).first == "-", stem.suffix(5).allSatisfy(\.isNumber) else {
+            throw ColibriError.invalidGGUF("\(path) has split.count \(count) but is not named <name>-NNNNN\(suffix)")
+        }
+        let prefix = stem.dropLast(6)
+        return (1...count).map { String(prefix) + String(format: "-%05d-of-%05d.gguf", $0, count) }
+    }
+
+    /// One file's header: metadata and its tensor table, offsets relative to that file.
+    struct Header {
+        var version: UInt32
+        var metadata: GGUFMetadata
+        var alignment: Int
+        var dataStart: Int
+        var tensors: [GGUFTensorInfo]
+    }
+
+    /// Parses the GGUF header of the `size` bytes at `base` (one file or one shard).
+    static func parseHeader(base: UnsafeRawPointer, size: Int, path: String) throws -> Header {
+        var r = GGUFByteReader(base: base, size: size)
 
         let magic = try r.read(UInt32.self)
         guard magic == 0x4655_4747 else { // "GGUF" little-endian
@@ -190,8 +266,8 @@ public final class GGUFFile: @unchecked Sendable {
         struct Raw { var name: String; var dims: [Int]; var type: GGMLType; var offset: Int }
         var raws = [Raw]()
         raws.reserveCapacity(Int(nTensors64))
-        var index = [String: Int]()
-        for i in 0..<Int(nTensors64) {
+        var names = Set<String>()
+        for _ in 0..<Int(nTensors64) {
             let name = try r.readString()
             let nd = try r.read(UInt32.self)
             guard nd >= 1 && nd <= 4 else {
@@ -216,16 +292,15 @@ public final class GGUFFile: @unchecked Sendable {
                 throw ColibriError.unsupported("\(path): tensor \(name) has unknown ggml type \(t32)")
             }
             let off = try r.read(UInt64.self)
-            guard off <= UInt64(file.fileSize), Int(off) % alignment == 0 else {
+            guard off <= UInt64(size), Int(off) % alignment == 0 else {
                 throw ColibriError.invalidGGUF("\(path): tensor \(name) offset \(off) is out of range or unaligned")
             }
             guard dims[0] % type.blockSize == 0 else {
                 throw ColibriError.invalidGGUF("\(path): tensor \(name) row of \(dims[0]) is not a multiple of \(type)'s block \(type.blockSize)")
             }
-            guard index[name] == nil else {
+            guard names.insert(name).inserted else {
                 throw ColibriError.invalidGGUF("\(path): duplicate tensor name \(name)")
             }
-            index[name] = i
             raws.append(Raw(name: name, dims: dims, type: type, offset: Int(off)))
         }
 
@@ -241,20 +316,13 @@ public final class GGUFFile: @unchecked Sendable {
                 bytes = p
             }
             let abs = dataStart + t.offset
-            guard abs <= file.fileSize, bytes <= file.fileSize - abs else {
-                throw ColibriError.invalidGGUF("\(path): tensor \(t.name) [\(abs), +\(bytes)) leaves the file (\(file.fileSize) bytes)")
+            guard abs <= size, bytes <= size - abs else {
+                throw ColibriError.invalidGGUF("\(path): tensor \(t.name) [\(abs), +\(bytes)) leaves the file (\(size) bytes)")
             }
             tensors.append(GGUFTensorInfo(name: t.name, dims: t.dims, type: t.type, relativeOffset: t.offset,
                                           fileOffset: abs, byteCount: bytes))
         }
-
-        self.version = version
-        self.metadata = md
-        self.tensors = tensors
-        self.alignment = alignment
-        self.dataStart = dataStart
-        self.file = file
-        self.index = index
+        return Header(version: version, metadata: md, alignment: alignment, dataStart: dataStart, tensors: tensors)
     }
 
     /// Tensor by name.

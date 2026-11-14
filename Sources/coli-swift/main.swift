@@ -165,6 +165,9 @@ func runInfo(_ o: CLIOptions) throws {
     let f = try GGUFFile(path: path)
     var s = "file: \(path)\n"
     s += "  GGUF v\(f.version), \(bytesString(f.file.fileSize)), alignment \(f.alignment), data at byte \(f.dataStart)\n"
+    if f.file.segments.count > 1 {
+        s += "  split model, \(f.file.segments.count) shards: \(f.file.segments.map { ($0.path as NSString).lastPathComponent }.joined(separator: ", "))\n"
+    }
     s += "  \(f.metadata.keys.count) metadata keys, \(f.tensors.count) tensors\n"
     let arch = f.metadata.architecture ?? "?"
     if let family = ModelRegistry.family(for: arch) {

@@ -204,17 +204,19 @@ public enum ExpertStores {
     public static func make(file: GGUFFile, layout: ExpertLayout, backend: Backend,
                             options: ExpertStoreOptions, engineName: String, topK: Int = 8) throws -> ExpertStore {
         try make(path: file.file.path, fileSize: file.file.fileSize, fileRegion: { file.file.region },
-                 layout: layout, backend: backend, options: options, engineName: engineName, topK: topK)
+                 layout: layout, backend: backend, options: options, engineName: engineName, topK: topK,
+                 segments: file.file.segments)
     }
 
     /// The history file used when `ExpertStoreOptions.historyPath` is nil.
     public static func defaultHistoryPath(modelPath: String) -> String { modelPath + ".coli_usage" }
 
     /// `make(file:)` without a parsed `GGUFFile`: the model's path and size, and the
-    /// whole-file mapping (only asked for when the store is resident).
+    /// whole-file mapping (only asked for when the store is resident). `segments`: the
+    /// model's files (a split model's shards); nil = the single file at `path`.
     public static func make(path: String, fileSize: Int, fileRegion: () throws -> MemoryRegion,
                             layout: ExpertLayout, backend: Backend, options: ExpertStoreOptions,
-                            engineName: String, topK: Int = 8) throws -> ExpertStore {
+                            engineName: String, topK: Int = 8, segments: [FileSegment]? = nil) throws -> ExpertStore {
         guard layout.fileEnd <= fileSize else {
             throw ColibriError.invalidGGUF("expert tensors end at byte \(layout.fileEnd), file has \(fileSize)")
         }
@@ -238,7 +240,7 @@ public enum ExpertStores {
                                        historyPath: options.saveHistory ? historyPath : nil)
         }
         let store = try StreamingExpertStore(
-            path: path, layout: layout, slotsPerLayer: slots, backend: backend, ioThreads: options.ioThreads,
+            segments: segments ?? [FileSegment(path: path, start: 0, size: fileSize)], layout: layout, slotsPerLayer: slots, backend: backend, ioThreads: options.ioThreads,
             history: history, historyPath: options.saveHistory ? historyPath : nil,
             uncached: options.uncached, topK: topK, repinEvery: options.repinEvery)
         if !history.isEmpty { store.pinFromHistory() }

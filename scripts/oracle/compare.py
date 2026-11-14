@@ -164,7 +164,9 @@ def main():
                 print('note: no fixture %s (record.py --real --real-models %s)' % (real, m['key']))
                 continue
             fx = json.load(open(real))
-            if os.path.getsize(m['path']) != fx['model']['bytes']:
+            if re.search(r'-\d{5}-of-\d{5}\.gguf$', m['path']):
+                print('note: %s is a split model; its size is not checked against the fixture' % m['path'])
+            elif os.path.getsize(m['path']) != fx['model']['bytes']:
                 problems.append({'label': m['key'], 'status': 'STALE', 'detail': 'file size differs from the fixture'})
                 continue
             for p in fx['prompts']:

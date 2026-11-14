@@ -176,7 +176,8 @@ final class LayerCache: @unchecked Sendable {
 final class StreamShared: @unchecked Sendable {
     let lock = NSCondition()
     let signal: HostSignal
-    let fd: Int32
+    /// One read-only descriptor per file of the model (one per shard of a split model).
+    let files: [(segment: FileSegment, fd: Int32)]
     var lastSeq: UInt64 = 0
     /// Every sequence number up to here has completed; the signal's value.
     var watermark: UInt64 = 0
@@ -193,9 +194,18 @@ final class StreamShared: @unchecked Sendable {
     /// use would otherwise deadlock on its own leases).
     var leaseWaitTimeout: Double = 10
 
-    init(signal: HostSignal, fd: Int32) {
+    init(signal: HostSignal, files: [(segment: FileSegment, fd: Int32)]) {
         self.signal = signal
-        self.fd = fd
+        self.files = files
+    }
+
+    /// Reads `count` bytes at mapping offset `offset` from the file that holds them (an
+    /// expert slice lies inside one tensor, so inside one file).
+    func read(into dst: UnsafeMutableRawPointer, count: Int, offset: Int) throws {
+        guard let f = files.first(where: { offset >= $0.segment.start && offset + count <= $0.segment.end }) else {
+            throw ColibriError.io(path: files.first?.segment.path ?? "?", operation: "read \(count) bytes at \(offset): outside every file", errno: EIO)
+        }
+        try IOPool.readFully(fd: f.fd, into: dst, count: count, offset: offset - f.segment.start)
     }
 
     func assignSeq() -> UInt64 {
@@ -273,6 +283,7 @@ public final class StreamingExpertStore: ExpertStore {
     public let topK: Int
     public let repinEvery: Int
     public let uncached: Bool
+    /// The first file's path.
     public let path: String
 
     let caches: [LayerCache?]
@@ -284,31 +295,55 @@ public final class StreamingExpertStore: ExpertStore {
 
     public convenience init(file: GGUFFile, layout: ExpertLayout, slotsPerLayer: [Int], backend: Backend,
                             ioThreads: Int, history: RoutingHistory?) throws {
-        try self.init(path: file.file.path, layout: layout, slotsPerLayer: slotsPerLayer, backend: backend,
+        try self.init(segments: file.file.segments, layout: layout, slotsPerLayer: slotsPerLayer, backend: backend,
                       ioThreads: ioThreads, history: history)
     }
 
+    /// A single-file model at `path` (see `init(segments:...)`).
+    public convenience init(path: String, layout: ExpertLayout, slotsPerLayer: [Int], backend: Backend,
+                            ioThreads: Int = 8, history: RoutingHistory? = nil, historyPath: String? = nil,
+                            uncached: Bool = true, topK: Int = 8, repinEvery: Int = 0) throws {
+        var st = stat()
+        guard stat(path, &st) == 0 else { throw ColibriError.io(path: path, operation: "stat", errno: errno) }
+        try self.init(segments: [FileSegment(path: path, start: 0, size: Int(st.st_size))], layout: layout,
+                      slotsPerLayer: slotsPerLayer, backend: backend, ioThreads: ioThreads, history: history,
+                      historyPath: historyPath, uncached: uncached, topK: topK, repinEvery: repinEvery)
+    }
+
     /// - Parameters:
-    ///   - path: the GGUF file; opened again for `pread` (with `F_NOCACHE` when `uncached`).
+    ///   - segments: the model's files and where each sits in the expert offsets
+    ///     (`MappedFile.segments`); each is opened again for `pread` (with `F_NOCACHE`
+    ///     when `uncached`).
     ///   - slotsPerLayer: slot count for each layer (indexed by layer; dense layers ignored),
     ///     clamped to the layer's expert count and to what one backend buffer can hold.
     ///   - topK: experts per token; pins never take more than `slots - topK` slots.
-    public init(path: String, layout: ExpertLayout, slotsPerLayer: [Int], backend: Backend,
+    public init(segments: [FileSegment], layout: ExpertLayout, slotsPerLayer: [Int], backend: Backend,
                 ioThreads: Int = 8, history: RoutingHistory? = nil, historyPath: String? = nil,
                 uncached: Bool = true, topK: Int = 8, repinEvery: Int = 0) throws {
         guard slotsPerLayer.count == layout.layers.count else {
             throw ColibriError.invalidArgument("\(slotsPerLayer.count) slot counts for \(layout.layers.count) layers")
         }
-        let fd = try IOPool.open(path, uncached: uncached)
-        var st = stat()
-        guard fstat(fd, &st) == 0 else {
-            let e = errno
-            Darwin.close(fd)
-            throw ColibriError.io(path: path, operation: "fstat", errno: e)
+        guard let path = segments.first?.path else { throw ColibriError.invalidArgument("no model files") }
+        var files: [(segment: FileSegment, fd: Int32)] = []
+        func closeAll() { for f in files { Darwin.close(f.fd) } }
+        for seg in segments {
+            let fd: Int32
+            do { fd = try IOPool.open(seg.path, uncached: uncached) } catch { closeAll(); throw error }
+            files.append((seg, fd))
+            var st = stat()
+            guard fstat(fd, &st) == 0 else {
+                let e = errno
+                closeAll()
+                throw ColibriError.io(path: seg.path, operation: "fstat", errno: e)
+            }
+            guard Int(st.st_size) == seg.size else {
+                closeAll()
+                throw ColibriError.invalidGGUF("\(seg.path) has \(st.st_size) bytes, expected \(seg.size)")
+            }
         }
-        guard layout.fileEnd <= Int(st.st_size) else {
-            Darwin.close(fd)
-            throw ColibriError.invalidGGUF("expert tensors end at byte \(layout.fileEnd), \(path) has \(st.st_size)")
+        guard layout.fileEnd <= segments.last!.end else {
+            closeAll()
+            throw ColibriError.invalidGGUF("expert tensors end at byte \(layout.fileEnd), \(path) has \(segments.last!.end)")
         }
         var caches: [LayerCache?] = []
         var weights: [ExpertLayerWeights?] = []
@@ -336,7 +371,7 @@ public final class StreamingExpertStore: ExpertStore {
                                                   down: stack(ll.down, arena.downOffset)))
             }
         } catch {
-            Darwin.close(fd)
+            closeAll()
             throw error
         }
         self.layout = layout
@@ -348,7 +383,7 @@ public final class StreamingExpertStore: ExpertStore {
         self.uncached = uncached
         self.caches = caches
         self.weightsByLayer = weights
-        self.shared = StreamShared(signal: backend.makeSignal(), fd: fd)
+        self.shared = StreamShared(signal: backend.makeSignal(), files: files)
         self.pool = IOPool(threads: ioThreads)
     }
 
@@ -362,7 +397,7 @@ public final class StreamingExpertStore: ExpertStore {
         guard !closed else { return }
         closed = true
         pool.shutdown()
-        Darwin.close(shared.fd)
+        for f in shared.files { Darwin.close(f.fd) }
     }
 
     // MARK: ExpertStore
@@ -433,11 +468,11 @@ public final class StreamingExpertStore: ExpertStore {
             if delay > 0 { usleep(delay) }
             let dst = lc.arena.slotPointer(s)
             let l = lc.layout
-            try IOPool.readFully(fd: shared.fd, into: dst + lc.arena.gateOffset, count: l.gate.bytesPerExpert,
+            try shared.read(into: dst + lc.arena.gateOffset, count: l.gate.bytesPerExpert,
                                  offset: l.gate.fileOffset + e * l.gate.bytesPerExpert)
-            try IOPool.readFully(fd: shared.fd, into: dst + lc.arena.upOffset, count: l.up.bytesPerExpert,
+            try shared.read(into: dst + lc.arena.upOffset, count: l.up.bytesPerExpert,
                                  offset: l.up.fileOffset + e * l.up.bytesPerExpert)
-            try IOPool.readFully(fd: shared.fd, into: dst + lc.arena.downOffset, count: l.down.bytesPerExpert,
+            try shared.read(into: dst + lc.arena.downOffset, count: l.down.bytesPerExpert,
                                  offset: l.down.fileOffset + e * l.down.bytesPerExpert)
         } catch {
             failure = error
