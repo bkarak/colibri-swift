@@ -74,6 +74,14 @@ each qwen36 process held about 8.7 GB on Qwen3-30B-A3B, so keep jobs x that unde
 divergence then cannot be told from a near tie without re-recording that prompt in full.
 Qwen3-30B-A3B Q4_K_M took about 6 minutes with `--light --jobs 5`.
 
+A model entry can name its prompt set (`"prompts": "qwen"` or `"olmoe"`, in `record.py`)
+and, for an engine without a token-dump mode (olmoe), a file of prompt ids under
+`prompt-ids/` made by the model's own Hugging Face tokenizer with `hf_tokenize.py` (in a
+throwaway Docker container; the command is in its header). The fixture then holds those
+ids, and `compare.py` fails a run as TOKENIZER when the port encodes the text differently.
+OLMoE's olmoe engine dumps every step's logits in one run, so it records in full (about 5
+minutes) without `--light`.
+
 ## Fixtures
 
 `Fixtures/oracle/tiny/<case>.json` (24 new tokens, 4 prompts each) and

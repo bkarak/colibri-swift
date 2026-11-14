@@ -52,7 +52,7 @@ TINY_PROMPTS = {
 }
 
 THINK_OFF = '<|im_start|>assistant\n<think>\n\n</think>\n\n'
-REAL_PROMPTS = [
+REAL_PROMPTS_QWEN = [
     ('chat_france', '<|im_start|>user\nWhat is the capital of France?<|im_end|>\n' + THINK_OFF),
     ('chat_haiku', '<|im_start|>user\nWrite a haiku about the sea.<|im_end|>\n' + THINK_OFF),
     ('raw_fox', 'The quick brown fox jumps over the lazy dog. The quick brown fox'),
@@ -61,6 +61,19 @@ REAL_PROMPTS = [
                           '<|im_start|>user\nΠώς λέγεται η πρωτεύουσα της Ελλάδας; Απάντησε με μία λέξη.<|im_end|>\n'
                           + THINK_OFF),
 ]
+
+# OLMoE-Instruct (its GGUF's own template: bos text, then Tulu-style turns).
+OLMOE_BOS = '|||IP_ADDRESS|||'
+REAL_PROMPTS_OLMOE = [
+    ('chat_france', OLMOE_BOS + '<|user|>\nWhat is the capital of France?\n<|assistant|>\n'),
+    ('chat_haiku', OLMOE_BOS + '<|user|>\nWrite a haiku about the sea.\n<|assistant|>\n'),
+    ('raw_fox', 'The quick brown fox jumps over the lazy dog. The quick brown fox'),
+    ('raw_code', 'def fibonacci(n):\n    """Return the n-th Fibonacci number."""\n'),
+    ('chat_greek_system', OLMOE_BOS + '<|system|>\nYou are a helpful assistant.\n'
+                          '<|user|>\nΠώς λέγεται η πρωτεύουσα της Ελλάδας; Απάντησε με μία λέξη.\n<|assistant|>\n'),
+]
+REAL_PROMPTS = {'qwen': REAL_PROMPTS_QWEN, 'olmoe': REAL_PROMPTS_OLMOE}
+PROMPT_IDS_DIR = os.path.join(REPO, 'scripts', 'oracle', 'prompt-ids')
 
 
 def log(*a):
@@ -143,7 +156,7 @@ class Upstream:
         return path
 
     def import_olmoe(self, gguf):
-        d = gguf[:-5] + '.import'
+        d = os.path.join(self.tmp, os.path.basename(gguf)[:-5] + '.import')   # link mode: nothing copied
         shutil.rmtree(d, ignore_errors=True)
         rc, out, err = run([sys.executable, '-I', self.importer, gguf, d], {})
         if rc != 0:
@@ -293,20 +306,29 @@ def record_real(up, pool, only, light=False):
         if not os.path.exists(gguf):
             log('[record] no %s, skipping %s' % (gguf, m['key']))
             continue
+        engine, experts = m['engine'], m.get('experts', 0)
+        # olmoe runs from an imported directory (gguf_import.py, link mode) and has no
+        # token-dump mode: its prompt ids come from the model's HF tokenizer (hf_tokenize.py).
+        model = up.import_olmoe(gguf) if engine == 'olmoe' else gguf
+        fixed_ids = None
+        if m.get('prompt_ids'):
+            fixed_ids = json.load(open(os.path.join(PROMPT_IDS_DIR, m['prompt_ids'])))['prompts']
+        prompt_set = REAL_PROMPTS[m.get('prompts', 'qwen')]
         def one(item):
             name, text = item
             t0 = time.time()
-            pids = up.tokenize(gguf, text)
+            pids = fixed_ids[name] if fixed_ids is not None else up.tokenize(gguf, text)
             if light:
                 # One greedy run plus the prefill logits: no per-step logits, so a divergence
                 # cannot be told from a near tie without re-recording that prompt in full.
-                ids, _ = up.generate(m['engine'], gguf, pids, REAL_NEW, exact=True)
-                _, pre = up.generate(m['engine'], gguf, pids, 1, exact=True, dump=True)
-                rows = [pre]
+                ids, _ = up.generate(engine, model, pids, REAL_NEW, exact=True, experts=experts)
+                _, pre = up.generate(engine, model, pids, 1, exact=True, dump=True, experts=experts)
+                rows = [pre[:vocab]]
             else:
-                ids, rows = up.steps(m['engine'], gguf, pids, REAL_NEW, vocab, pool=pool)
-            ids_default, pre_default = up.generate(m['engine'], gguf, pids, 1, exact=False, dump=True)
-            ids_default, _ = up.generate(m['engine'], gguf, pids, REAL_NEW, exact=False)
+                ids, rows = up.steps(engine, model, pids, REAL_NEW, vocab, experts=experts, pool=pool)
+            ids_default, pre_default = up.generate(engine, model, pids, 1, exact=False, dump=True, experts=experts)
+            pre_default = pre_default[:vocab]
+            ids_default, _ = up.generate(engine, model, pids, REAL_NEW, exact=False, experts=experts)
             log('[record] %s %-18s %6.1fs  %d prompt ids -> %s' % (m['key'], name, time.time() - t0, len(pids), ' '.join(map(str, ids))))
             return {'name': name, 'text': text, 'prompt_ids': pids,
                     'greedy_exact': ids, 'greedy_default': ids_default,
@@ -314,13 +336,16 @@ def record_real(up, pool, only, light=False):
                     'prefill_top_exact': top(rows[0], REAL_PREFILL_TOP),
                     'prefill_top_default': top(pre_default, REAL_PREFILL_TOP)}
         # light: prompts in parallel (each run is single-threaded and slow); full: steps in parallel
-        prompts = list(pool.map(one, REAL_PROMPTS)) if light else [one(x) for x in REAL_PROMPTS]
+        prompts = list(pool.map(one, prompt_set)) if light else [one(x) for x in prompt_set]
         st = os.stat(gguf)
         fixture = {
             'model': {'file': os.path.basename(gguf), 'bytes': st.st_size, 'architecture': m['arch'], 'vocab_size': vocab},
-            'upstream': {'commit': UPSTREAM_COMMIT, 'engine': m['engine'],
-                         'command': 'SNAP=<gguf> COLI_LOOKUP=0 GQ_EXACT=1 DUMP=<f32> ./qwen36 0 4 ref.json',
-                         'tokenize': 'SNAP=<gguf> TOK_ONLY=1 ./qwen36 0 4 prompt.txt', 'kv_cache': 'f32'},
+            'upstream': {'commit': UPSTREAM_COMMIT, 'engine': engine,
+                         'command': ('SNAP=<gguf> COLI_LOOKUP=0 GQ_EXACT=1 DUMP=<f32> ./qwen36 0 4 ref.json' if engine == 'qwen36'
+                                     else 'gguf_import.py <gguf> <dir>; SNAP=<dir> COLI_LOOKUP=0 GQ_EXACT=1 DUMP=<f32> ./olmoe %d 8 ref.json' % max(experts, 8)),
+                         'tokenize': ('SNAP=<gguf> TOK_ONLY=1 ./qwen36 0 4 prompt.txt' if fixed_ids is None
+                                      else 'HF tokenizers, scripts/oracle/prompt-ids/' + m['prompt_ids']),
+                         'kv_cache': 'f32'},
             'n_new': REAL_NEW, 'prompts': prompts, 'steps': 'prefill only' if light else 'every step',
         }
         os.makedirs(FIXTURES, exist_ok=True)
@@ -340,7 +365,11 @@ def main():
     ap.add_argument('--skip-generate', action='store_true', help='reuse the tiny models already in --models')
     ap.add_argument('--scratch', default=os.path.join(REPO, '.build-oracle'), help='SwiftPM scratch path')
     ap.add_argument('--jobs', type=int, default=os.cpu_count() or 4)
+    ap.add_argument('--print-prompts', choices=sorted(REAL_PROMPTS), help='print a real prompt set as JSON (for hf_tokenize.py) and exit')
     a = ap.parse_args()
+    if a.print_prompts:
+        print(json.dumps(REAL_PROMPTS[a.print_prompts], ensure_ascii=False))
+        return
     both = not a.tiny and not a.real
     subprocess.run([os.path.join(REPO, 'scripts', 'oracle', 'build-upstream.sh')], check=True,
                    env=dict(os.environ, ORACLE_DIR=ORACLE_DIR))

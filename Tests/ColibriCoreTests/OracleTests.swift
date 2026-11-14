@@ -246,4 +246,25 @@ enum Oracle {
         }
         for m in failures { Issue.record(Comment(rawValue: m)) }
     }
+
+    /// Real OLMoE-1B-7B-0125-Instruct (4.2 GB, `COLIBRI_OLMOE_GGUF` or the default download
+    /// path). Upstream's olmoe engine has no token dump, so the fixture's prompt ids come from
+    /// the model's own HF tokenizer (scripts/oracle/hf_tokenize.py); the port must match them.
+    static var olmoePath: String {
+        ProcessInfo.processInfo.environment["COLIBRI_OLMOE_GGUF"]
+            ?? NSHomeDirectory() + "/colibri-models/olmoe-1b-7b/OLMoE-1B-7B-0125-Instruct-Q4_K_M.gguf"
+    }
+
+    @Test(.enabled(if: Oracle.real && FileManager.default.fileExists(atPath: OracleTests.olmoePath)))
+    func engineMatchesUpstreamOnOLMoE() throws {
+        let f = try Oracle.load("olmoe-1b-7b-0125-instruct-q4_k_m.json")
+        let tok = try BPETokenizer(metadata: GGUFFile(path: Self.olmoePath).metadata)
+        var failures: [String] = []
+        for p in f.prompts {
+            #expect(tok.encode(p.text) == p.promptIds, "olmoe tokenizer vs HF: \(p.name ?? "?")")
+            guard let o = try Oracle.run(path: Self.olmoePath, prompt: p.promptIds, steps: f.nNew) else { return }
+            failures += Oracle.compare("olmoe/\(p.name ?? "?")", p, o, tolerance: Oracle.realLogitTolerance)
+        }
+        for m in failures { Issue.record(Comment(rawValue: m)) }
+    }
 }

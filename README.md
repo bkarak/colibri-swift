@@ -87,7 +87,7 @@ Main options (`coli-swift --help` lists all):
 |---|---|---|
 | `qwen3` | Qwen3 dense (0.6B ... 32B) | `Sources/ColibriCore/Models/Qwen3.swift` |
 | `qwen3moe` | Qwen3-30B-A3B, Qwen3-Coder-30B-A3B | `Qwen3MoE.swift` |
-| `olmoe` | OLMoE-1B-7B | `OLMoE.swift` |
+| `olmoe` | OLMoE-1B-7B (0924 and 0125, base and Instruct) | `OLMoE.swift` |
 
 Weight types, on both backends: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K,
 Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS. That covers the common `Q4_K_M`, `Q5_K_M`, `Q6_K` and
@@ -97,10 +97,11 @@ it. Metal also refuses, at load, shapes its kernels do not handle (attention hea
 256 or not a multiple of 4, a matrix row length not a multiple of 32, more than 2048 router
 experts); with `--backend auto` such a model runs on the CPU instead.
 
-Two real models have been run against upstream: Qwen3-0.6B (Q8_0, dense) and
-Qwen3-30B-A3B (Q4_K_M, MoE, 128 experts, top 8). All three families were also verified on
-small random GGUFs written by `Sources/ColibriCore/Synthetic/TinyModel.swift` with the real
-tensor layout (below). A real OLMoE file has not been run yet.
+Each family has been run as a real model against upstream: Qwen3-0.6B (Q8_0, dense),
+Qwen3-30B-A3B (Q4_K_M, MoE, 128 experts, top 8) and OLMoE-1B-7B-0125-Instruct (Q4_K_M, MoE,
+64 experts, top 8, Allen AI's own GGUF). All three were also verified on small random GGUFs
+written by `Sources/ColibriCore/Synthetic/TinyModel.swift` with the real tensor layout
+(below).
 
 ## Verification
 
@@ -113,6 +114,8 @@ runs `coli-swift generate` on every fixture prompt and reports the first diverge
 |---|---|---|
 | Qwen3-0.6B Q8_0 vs upstream: 5 prompts (chat, raw English, raw Python, Greek with a system message) x 32 tokens | 5/5 match | 5/5 match |
 | Qwen3-30B-A3B Q4_K_M vs upstream: the same 5 prompts x 32 tokens (prefill top-20 logits within 5e-5) | 5/5 match | 5/5 match |
+| OLMoE-1B-7B-0125-Instruct Q4_K_M vs upstream: 5 prompts (its own chat template, raw English, raw Python, Greek with a system message) x 32 tokens; prompt ids from the model's HF tokenizer, which the port matches (prefill top-20 logits within 3e-5) | 5/5 match | 5/5 match |
+| OLMoE with streamed experts, `--expert-cache-gb 0.5` (8 of 64 slots per layer) | 5/5 match | 5/5 match |
 | Qwen3-30B-A3B with streamed experts: caches of 4 and 1 GB (Metal; 31 and 8 of 128 slots per layer) and 2 GB (CPU) | 5/5 match | 5/5 match |
 | synthetic qwen3, qwen3moe, olmoe vs upstream: 16 models (F32, Q8_0, Q4_K, Q4_K_M, tied head, Qwen vocabulary) x 4 prompts x 24 tokens | 64/64 match | 64/64 match |
 | same, f16 KV cache | | 68/69 match, 1 near-tie (`olmoe_q4_K` prompt 3, step 18: upstream's own top-2 gap 0.0038) |
@@ -164,6 +167,9 @@ but the default `--batch 64` and 2 runs:
 | Metal, resident (zero-copy, 16.35 GiB of experts) | 222 | 84 |
 | CPU, resident | 32 | 10.7 |
 | Metal, streamed through an 8 / 4 / 2 GB cache, `--direct` (128 tokens of `generate`) | | 29.9 / 27.0 / 25.4 |
+
+OLMoE-1B-7B-0125-Instruct Q4_K_M (3.9 GiB, 1.3B active parameters per token), same settings:
+Metal 640 tok/s prefill and 231 tok/s decode, CPU 81 and 28.9.
 
 The streamed rows were measured with the whole file already in the macOS file cache, so
 the reads came from RAM (24-56 GB/s), not the SSD: `F_NOCACHE` does not drop pages that are

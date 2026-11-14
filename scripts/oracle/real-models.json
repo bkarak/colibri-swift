@@ -1,6 +1,5 @@
 [
-  {"key": "qwen3-0.6b-q8_0", "arch": "qwen3", "engine": "qwen36", "vocab": 151936,
-   "gguf": "~/colibri-models/qwen3-0.6b/Qwen3-0.6B-Q8_0.gguf", "env": "COLIBRI_QWEN3_GGUF"},
-  {"key": "qwen3-30b-a3b-q4_k_m", "arch": "qwen3moe", "engine": "qwen36", "vocab": 151936,
-   "gguf": "~/colibri-models/qwen3-30b-a3b/Qwen3-30B-A3B-Q4_K_M.gguf", "env": "COLIBRI_QWEN3MOE_GGUF"}
+  {"key": "qwen3-0.6b-q8_0", "arch": "qwen3", "engine": "qwen36", "vocab": 151936, "gguf": "~/colibri-models/qwen3-0.6b/Qwen3-0.6B-Q8_0.gguf", "env": "COLIBRI_QWEN3_GGUF"},
+  {"key": "qwen3-30b-a3b-q4_k_m", "arch": "qwen3moe", "engine": "qwen36", "vocab": 151936, "gguf": "~/colibri-models/qwen3-30b-a3b/Qwen3-30B-A3B-Q4_K_M.gguf", "env": "COLIBRI_QWEN3MOE_GGUF"},
+  {"key": "olmoe-1b-7b-0125-instruct-q4_k_m", "arch": "olmoe", "engine": "olmoe", "vocab": 50304, "experts": 64, "prompts": "olmoe", "prompt_ids": "olmoe-1b-7b-0125-instruct.json", "gguf": "~/colibri-models/olmoe-1b-7b/OLMoE-1B-7B-0125-Instruct-Q4_K_M.gguf", "env": "COLIBRI_OLMOE_GGUF"}
 ]

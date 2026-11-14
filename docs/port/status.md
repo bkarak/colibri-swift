@@ -34,6 +34,10 @@ DIVERGED with the step.
 | Qwen3-0.6B Q8_0, 5 prompts x 32 tokens | Metal | 5/5 | none |
 | Qwen3-30B-A3B Q4_K_M, the same 5 prompts x 32 tokens (fixture recorded with `record.py --light`: greedy ids and prefill top-20 only; prefill logits within 5e-5) | CPU | 5/5 | none |
 | same | Metal | 5/5 | none |
+| OLMoE-1B-7B-0125-Instruct Q4_K_M, 5 OLMoE-template and raw prompts x 32 tokens; prompt ids from the model's HF `tokenizer.json` (`scripts/oracle/hf_tokenize.py`), which the port's tokenizer matches on all 5; every step's logits recorded; prefill logits within 3e-5 | CPU, Metal | 5/5, 5/5 | none |
+| same, experts streamed: `--expert-cache-gb 0.5` (8 of 64 slots per layer) | CPU, Metal | 5/5, 5/5 | none |
+| same, `--int8` vs upstream's default int8 path | CPU | 3/5 | `raw_fox` step 6 and `raw_code` step 8 (the known int8 gap, section 4) |
+| same | Metal | 5/5 | none |
 | same, experts streamed: `--expert-cache-gb 4` and `1` (31 and 8 of 128 slots per layer) | Metal | 5/5, 5/5 | none |
 | same, experts streamed: `--expert-cache-gb 2` | CPU | 5/5 | none |
 | 16 synthetic models x 4 prompts x 24 tokens (qwen3, qwen3moe, olmoe; F32, Q8_0, Q4_K, Q4_K_M mix, tied head, Qwen vocabulary) | CPU | 64/64 | none |
@@ -91,6 +95,9 @@ Before the split-KV attention kernel (one threadgroup per head) these were 110 t
 512 tokens and 70 after 2048. During decode the GPU is busy about 93% of the wall time, so
 the remaining cost is in the kernels, not in host round trips.
 
+OLMoE-1B-7B-0125-Instruct Q4_K_M, same settings: Metal 640 tok/s prefill, 231 decode; CPU
+81 and 28.9. A two-turn chat on Metal reused all 139 tokens of turn 1 from the KV cache.
+
 Qwen3-30B-A3B Q4_K_M, 512-token prompt, 128 generated tokens, `--batch 64`, median of 2:
 Metal resident 222 tok/s prefill, 84 decode; CPU resident 32 and 10.7. Streamed on Metal
 with `--direct` (128 tokens of `generate`): 29.9 / 27.0 / 25.4 tok/s decode with 8 / 4 / 2 GB
@@ -100,8 +107,9 @@ evict pages already cached, and the whole file was. A disk-bound measurement nee
 
 ## 4. Known gaps
 
-**OLMoE not run on real weights.** `qwen3moe` has been run on the real Qwen3-30B-A3B
-(section 2); `olmoe` is verified only on synthetic GGUFs that use the real tensor layout.
+**Real models run.** One per family: Qwen3-0.6B, Qwen3-30B-A3B and
+OLMoE-1B-7B-0125-Instruct, all against upstream (section 2). Other quantisations of them
+(only Q8_0 and Q4_K_M files were run) and the 0924 OLMoE release have not been.
 
 **First prompt on Metal (fixed).** The first forward of a process used to wait about
 1.6 s on Qwen3-30B-A3B (7 s with part of the file out of the page cache) before the GPU
