@@ -39,7 +39,7 @@ struct CLIOptions {
     var dumpLogits: String?
     var ignoreEOS = false
     var kvType: ScalarType = .f32
-    var maxBatch = 64
+    var maxBatch = 512
     var stats = false
     /// CPU: upstream's default int8-activation path instead of the float path.
     var int8 = false
@@ -85,7 +85,7 @@ struct CLIOptions {
       --dump-logits PATH       write every step's logits to PATH (steps x vocab float32 LE)
       --ignore-eos             keep generating past stop tokens
       --kv f32|f16             KV cache element type (default f32)
-      --batch N                largest prefill chunk in tokens (default 64)
+      --batch N                largest prefill chunk in tokens (default 512)
       --stats                  bench/chat: print expert cache counters (generate always prints them for MoE models)
       --int8                   cpu: int8 activations (upstream's default) instead of float
       --prompt-tokens N        bench: prompt length when --prompt is not given (default 128)

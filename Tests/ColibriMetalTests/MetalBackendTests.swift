@@ -41,7 +41,7 @@ import ColibriMetal
             (WeightView(region: region, offset: leading, type: type, cols: cols, rows: rows), 0),
             (WeightView(region: region, offset: leading + 5 * rb, type: type, cols: cols, rows: rows - 5, scale: 0.75), 5),
         ]
-        for batch in [1, 3, 8, 13] {
+        for batch in [1, 3, 8, 13, 21, 33] {  // 21 and 33 take the tiled kernel (one partial tile)
             let x = rng.floats(batch * cols)
             for (view, r0) in views {
                 let (c, m) = try twin.both { b -> () -> [Float] in
@@ -53,6 +53,34 @@ import ColibriMetal
                 expectClose(c, m, rel: 3e-5, abs: 1e-6, scale: mag, "\(type) matmul batch \(batch) row0 \(r0)")
             }
         }
+    }
+
+    /// The tiled prefill kernel over several 64-row x 32-token tiles with partial edges
+    /// in both directions, against the CPU and against the matvec prefill kernel.
+    @Test(arguments: metalWeightTypes)
+    func tiledMatmulMatchesCPUAndMatvec(_ type: GGMLType) throws {
+        let rows = 200, cols = 768, batch = 70
+        var rng = TestRNG(UInt64(type.rawValue) + 700)
+        let bytes = try Quantize.encode(rng.floats(rows * cols), as: type)
+        let w = dequantRows(type, bytes, rows: rows, cols: cols)
+        let view = WeightView(region: makeRegion(bytes, leading: 64), offset: 64, type: type, cols: cols, rows: rows, scale: 0.5)
+        let x = rng.floats(batch * cols)
+        let (c, m) = try twin.both { b -> () -> [Float] in
+            let xb = try b.upload(x), yb = try b.zeros(batch * rows)
+            b.matmul(view, xb.slice(), into: yb.slice(), batch: batch)
+            return { yb.f }
+        }
+        let mag = Self.magnitudes(w, rows: rows, cols: cols, rowOffset: 0, viewRows: rows, x, batch: batch, scale: 0.5)
+        expectClose(c, m, rel: 3e-5, abs: 1e-6, scale: mag, "\(type) tiled matmul")
+        // The matvec prefill kernel on the same data.
+        twin.metal.tiledMinBatch = .max
+        defer { twin.metal.tiledMinBatch = 20 }
+        let mv = try twin.both { b -> () -> [Float] in
+            let xb = try b.upload(x), yb = try b.zeros(batch * rows)
+            b.matmul(view, xb.slice(), into: yb.slice(), batch: batch)
+            return { yb.f }
+        }.1
+        expectClose(mv, m, rel: 3e-5, abs: 1e-6, scale: mag, "\(type) tiled vs matvec")
     }
 
     /// Tall matrices (output heads) take the two-rows-per-simdgroup decode kernel.

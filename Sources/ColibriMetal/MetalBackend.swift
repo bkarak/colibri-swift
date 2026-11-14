@@ -33,6 +33,10 @@ public final class MetalBackend: Backend {
     /// lanes per 32-weight unit (R, L in {1, 2, 4}; `tune_*` kernels exist for Q8_0, Q4_K
     /// and Q6_K only). Nil in normal use.
     public var tuneDecode: (rows: Int, lanes: Int)?
+    /// Dense matmuls with at least this many batch rows use the tiled simdgroup-matrix
+    /// kernel (`matmul_tiled_*`); smaller batches use the matvec kernels. `Int.max` turns
+    /// it off (tests compare the two). `COLIBRI_TILED_MIN_BATCH` overrides the default.
+    public var tiledMinBatch: Int = ProcessInfo.processInfo.environment["COLIBRI_TILED_MIN_BATCH"].flatMap(Int.init) ?? 20
     /// Number of command buffers committed since the backend was created.
     public private(set) var batchesCommitted = 0
 
@@ -431,6 +435,19 @@ public final class MetalBackend: Backend {
         require(x.count >= batch * w.cols && y.count >= batch * w.rows, "matmul: slice too small")
         require(w.offset >= 0 && w.offset + w.byteCount <= w.region.length, "matmul: weight outside its region")
         checkWeightAlignment(w.type, w.offset, op: "matmul")
+        if batch >= tiledMinBatch {
+            // Prefill on the simdgroup matrix units: 64-row x 32-token tiles.
+            let e = compute
+            e.setComputePipelineState(kernel("matmul_tiled_" + MetalBackend.kernelSuffix(w.type)))
+            let delta = bindWeights(e, w.region, offset: w.offset, length: w.byteCount, index: 0)
+            bind(e, x, 1)
+            bind(e, y, 2)
+            setParams(e, MMParams(rowBytes: UInt64(w.rowBytes), wDelta: delta, cols: UInt32(w.cols), rows: UInt32(w.rows),
+                                  batch: UInt32(batch), xStride: UInt32(w.cols), yStride: UInt32(w.rows), scale: w.scale), index: 3)
+            e.dispatchThreadgroups(MTLSize(width: (w.rows + 63) / 64, height: (batch + 31) / 32, depth: 1),
+                                   threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+            return
+        }
         let prefill = batch > 1
         let ns = prefill ? MetalBackend.prefillTile : 1
         // Decode: one row per simdgroup keeps a layer's 768..4096-row matrices spread over

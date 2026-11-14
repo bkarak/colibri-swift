@@ -153,17 +153,17 @@ for it (`--light` for big models: one run per prompt instead of one per step).
 
 Qwen3-0.6B Q8_0 on an M4 Max (16 cores, 40-core GPU, 64 GB), release build, a 512-token
 prompt then 128 generated tokens, median of 3 runs
-(`coli-swift bench --prompt-tokens 512 --max-tokens 128 --runs 3 --batch 512`):
+(`coli-swift bench --prompt-tokens 512 --max-tokens 128 --runs 3`, default `--batch 512`):
 
 | backend | prefill tok/s | decode tok/s |
 |---|---|---|
-| Metal, f32 KV | 2031 | 220 |
-| Metal, f16 KV | 2075 | 218 |
+| Metal, f32 KV | 5237 | 220 |
+| Metal, f16 KV | 5624 | 204 |
 | CPU, float path (the reference) | 345 | 37.5 |
 | CPU, `--int8` | 759 | 67.5 |
 
 Qwen3-30B-A3B Q4_K_M (17.3 GiB, 3.3B active parameters per token), same machine and settings
-but the default `--batch 64` and 2 runs:
+but `--batch 64` (the default then) and 2 runs:
 
 | backend, experts | prefill tok/s | decode tok/s |
 |---|---|---|
@@ -178,8 +178,8 @@ Qwen3-4B Q4_K_M (2.3 GiB, dense, 4B parameters per token), same settings, 3 runs
 
 | backend | prefill tok/s | decode tok/s |
 |---|---|---|
-| Metal, f32 KV | 279 | 87 |
-| Metal, f16 KV | 283 | 92 |
+| Metal, f32 KV | 951 | 91 |
+| Metal, f16 KV | 892 | 84 |
 | CPU, float path | 44.6 | 10.7 |
 | CPU, `--int8` | 54.8 | 15.7 |
 
@@ -207,6 +207,9 @@ after 512 tokens of context):
 | Qwen3-30B-A3B Q4_K_M | 1660 / 226 (7.3x) | 128 / 81 (1.6x) | 210 / 35.2 (6.0x) | 69.3 / 11.3 (6.1x) |
 
 llama.cpp is 1.35-1.6x faster at Metal decode, 5-7x at Metal prefill and 5-7x on the CPU.
+Since then a tiled prefill kernel and a default `--batch` of 512 brought the dense models'
+Metal prefill to 5237 (Qwen3-0.6B) and 951 tok/s (Qwen3-4B), within 2x of llama.cpp; the
+MoE models' prefill is unchanged.
 Method and where the gap comes from: `docs/port/status.md` section 3.
 
 ## Adding a model family

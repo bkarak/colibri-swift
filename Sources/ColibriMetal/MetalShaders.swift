@@ -21,7 +21,8 @@
 // * Host-side constants that must match: MM_NSG simdgroups per matmul threadgroup, the R
 //   of each matmul variant (see INSTANTIATE), ATT_NSG for attention.
 // * Kernel names: `matmul_<type>_1` (decode, R = 1), `matmul_<type>_1w` (decode, R = 2),
-//   `matmul_<type>_8` (prefill), `matmul_id_<type>`, `embed_<type>`, with <type> the
+//   `matmul_<type>_8` (small prefill batches), `matmul_tiled_<type>` (prefill batches of
+//   `MetalBackend.tiledMinBatch` or more), `matmul_id_<type>`, `embed_<type>`, with <type> the
 //   lower-cased ggml name (`q8_0`, `q4_k`, ...). MetalBackend looks them up by name.
 
 enum MetalShaders {
@@ -311,6 +312,66 @@ kernel void k_matmul(device const uchar *W   [[buffer(0)]],
     }
 }
 
+// Prefill: a tiled product on the simdgroup matrix units (llama.cpp's mul_mm, in f32).
+// A threadgroup of 4 simdgroups computes a 64-row x 32-token tile of Y. For each
+// 32-weight unit of the rows, 128 threads decode the tile's 64 x 32 weights once into
+// threadgroup memory (the DQ decoders, f32) next to the 32 x 32 activations; each
+// simdgroup then multiplies a 32 x 16 block as 8x8 f32 simdgroup matrices. Sums are f32
+// throughout; only their order differs from the matvec kernels. The tile is staged in
+// threadgroup memory and written with bounds checks (rows past `rows` re-read the last
+// row, tokens past `batch` read zeros; both are dropped).
+// Grid (ceil(rows / MMT_BM), ceil(batch / MMT_BN)), 128 threads.
+#define MMT_BM 64
+#define MMT_BN 32
+template<typename DQ>
+kernel void k_matmul_tiled(device const uchar *W   [[buffer(0)]],
+                           device const float *X   [[buffer(1)]],
+                           device float *Y         [[buffer(2)]],
+                           constant MMParams &p    [[buffer(3)]],
+                           uint3 tg                [[threadgroup_position_in_grid]],
+                           ushort tid              [[thread_index_in_threadgroup]],
+                           ushort sg               [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float sa[MMT_BM * 32];   // weights [row][k]; later the output [token][row]
+    threadgroup float sb[MMT_BN * 32];   // activations [token][k]
+    const uint row0 = tg.x * MMT_BM, s0 = tg.y * MMT_BN;
+    const uint lr = tid >> 1, lj = (tid & 1) * 4;      // weight loader: row, first float4 group
+    device const uchar *wrow = W + p.wDelta + (ulong)min(row0 + lr, p.rows - 1) * p.rowBytes;
+    const uint xs = tid >> 2, xj = (tid & 3) * 2;      // activation loader: token, first group
+    const bool xin = s0 + xs < p.batch;
+    device const float *xrow = X + (ulong)min(s0 + xs, p.batch - 1) * p.xStride;
+    const uint sr = (sg & 1) * 32, st = (sg >> 1) * 16; // this simdgroup's rows and tokens
+    simdgroup_float8x8 acc[4][2];
+    for (int i = 0; i < 4; ++i) for (int j = 0; j < 2; ++j) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    const uint nunits = p.cols / 32;
+    for (uint u = 0; u < nunits; ++u) {
+        DQ q(wrow, u);
+        for (uint jj = 0; jj < 4; ++jj) {
+            *(threadgroup float4 *)(sa + lr * 32 + 4 * (lj + jj)) = q.get(lj + jj);
+        }
+        for (uint jj = 0; jj < 2; ++jj) {
+            float4 v = xin ? float4(*(device const packed_float4 *)(xrow + u * 32 + 4 * (xj + jj))) : float4(0.0f);
+            *(threadgroup float4 *)(sb + xs * 32 + 4 * (xj + jj)) = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = 0; k < 32; k += 8) {
+            simdgroup_float8x8 a[4], b[2];
+            for (int i = 0; i < 4; ++i) simdgroup_load(a[i], sa + (sr + 8 * i) * 32 + k, 32);
+            for (int j = 0; j < 2; ++j) simdgroup_load(b[j], sb + (st + 8 * j) * 32 + k, 32, ulong2(0, 0), true);
+            for (int i = 0; i < 4; ++i)
+                for (int j = 0; j < 2; ++j) simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 2; ++j)
+            simdgroup_store(acc[i][j], sa + (st + 8 * j) * MMT_BM + sr + 8 * i, MMT_BM, ulong2(0, 0), true);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = tid; e < MMT_BM * MMT_BN; e += 128) {
+        const uint s = e / MMT_BM, r = e % MMT_BM;
+        if (s0 + s < p.batch && row0 + r < p.rows) Y[(ulong)(s0 + s) * p.yStride + row0 + r] = p.scale * sa[e];
+    }
+}
+
 struct MMIdParams {
     ulong rowBytes;
     ulong stride;       // bytes between matrix i and i + 1
@@ -379,6 +440,7 @@ kernel void k_embed(device const uchar *W     [[buffer(0)]],
 typedef decltype(k_matmul<DQ_Q8_0, 1, 4, 4>) matmul_t;
 typedef decltype(k_matmul_id<DQ_Q8_0, 4>) matmul_id_t;
 typedef decltype(k_embed<DQ_Q8_0>) embed_t;
+typedef decltype(k_matmul_tiled<DQ_Q8_0>) matmul_tiled_t;
 
 // Per type: L = lanes per 32-weight unit. Decode uses R = 1 row per simdgroup ("_1",
 // more threadgroups for the 768..4096-row matrices of a layer) or R = 2 ("_1w", for
@@ -389,6 +451,7 @@ typedef decltype(k_embed<DQ_Q8_0>) embed_t;
 template [[host_name("matmul_" #NAME "_1")]] kernel matmul_t k_matmul<DQ, 1, 1, L>; \
 template [[host_name("matmul_" #NAME "_1w")]] kernel matmul_t k_matmul<DQ, 1, 2, L>; \
 template [[host_name("matmul_" #NAME "_8")]] kernel matmul_t k_matmul<DQ, 8, 2, L>; \
+template [[host_name("matmul_tiled_" #NAME)]] kernel matmul_tiled_t k_matmul_tiled<DQ>; \
 template [[host_name("matmul_id_" #NAME)]] kernel matmul_id_t k_matmul_id<DQ, L>; \
 template [[host_name("embed_" #NAME)]] kernel embed_t k_embed<DQ>;
 

@@ -86,9 +86,9 @@ Qwen3-0.6B Q8_0, release build, 512-token prompt, 128 generated tokens, median o
 
 | backend | prefill tok/s | decode tok/s |
 |---|---|---|
-| Metal, f32 KV, `--batch 512` | 2031 | 220 |
-| Metal, f32 KV, default `--batch 64` | 1967 | 220 |
-| Metal, f16 KV | 2075 | 218 |
+| Metal, f32 KV (default `--batch 512`, tiled prefill kernel) | 5237 | 220 |
+| Metal, f16 KV | 5624 | 204 |
+| Metal, before the tiled kernel, `--batch 512` / `--batch 64` | 2031 / 1967 | 220 |
 | CPU, float path | 345 | 37.5 |
 | CPU, `--int8` | 759 | 67.5 |
 
@@ -101,7 +101,8 @@ OLMoE-1B-7B-0125-Instruct Q4_K_M, same settings: Metal 640 tok/s prefill, 231 de
 81 and 28.9. A two-turn chat on Metal reused all 139 tokens of turn 1 from the KV cache.
 
 Qwen3-4B Q4_K_M (2.3 GiB, dense), same settings, median of 3: Metal 279 tok/s prefill, 87
-decode (f16 KV: 283 and 92); CPU 44.6 and 10.7; CPU `--int8` 54.8 and 15.7.
+decode (f16 KV: 283 and 92); CPU 44.6 and 10.7; CPU `--int8` 54.8 and 15.7. With the tiled
+prefill kernel and `--batch 512` (section 3, below): Metal 951 tok/s prefill (f16 KV: 892).
 Decode reads about 2.5 GB of weights per token, so 87 tok/s is about 215 GB/s, about 40% of
 the M4 Max's 546 GB/s. Prefill uses the decode matvec kernel over groups of tokens, in
 fp32; it has no simdgroup-matrix (tiled matrix-multiply) kernel, which is where llama.cpp's
@@ -131,7 +132,7 @@ to match coli-swift's decode after a 512-token prompt; its defaults otherwise (f
 flash attention auto, `-ngl 99`). CPU: `-ngl 0 -dev none -t 12`. With `-t 16` llama.cpp's CPU
 decode collapses (Qwen3-4B 2.8 tok/s, Qwen3-0.6B 8.5) as threads land on the efficiency cores;
 12 is its default and the performance-core count. coli-swift: `bench --prompt-tokens 512
---max-tokens 128 --runs 3`, default `--batch 64` and f32 KV on Metal, the better of
+--max-tokens 128 --runs 3`, `--batch 64` (the default then) and f32 KV on Metal, the better of
 `--threads 12` and `16` on the CPU (within 10% of each other). Same machine, same session,
 same GGUF files, 2026-11-14.
 
@@ -139,7 +140,8 @@ Where the gap most likely comes from (from how llama.cpp is built; not profiled 
 
 - **Metal prefill (5-7x).** llama.cpp switches to tiled matrix-multiply kernels
   (`simdgroup_matrix`, half precision) once a batch has more than a few tokens. coli-swift
-  runs the decode matvec over groups of tokens, in fp32.
+  ran the decode matvec over groups of tokens, in fp32. It now has a tiled f32 kernel for
+  dense matmuls (below); the routed expert matmuls still use the matvec kernel.
 - **Metal decode (1.35-1.6x).** Both are bound by reading the weights. llama.cpp's kernels
   reach about 55% of the memory bandwidth on Qwen3-4B, coli-swift's about 40%; llama.cpp
   also fuses more of each layer (norm, rope, flash attention) into fewer dispatches.
@@ -150,6 +152,31 @@ Where the gap most likely comes from (from how llama.cpp is built; not profiled 
   the per-16 scaling in scalar floats, and runs MoE expert rows one token at a time.
   llama.cpp's CPU decode is close to coli-swift's Metal decode. (Measured before the
   `--int8` fix below; the float path is unchanged.)
+
+### Tiled prefill kernel
+
+Dense matmuls with 20 or more batch rows run on `matmul_tiled_<type>`: a threadgroup of 4
+simdgroups computes a 64-row x 32-token tile, each 32-weight unit is decoded once into
+threadgroup memory (f32, the same block decoders) beside its 32 x 32 activations, and the
+products run as 8x8 f32 `simdgroup_matrix` multiply-accumulates. Everything stays f32
+(llama.cpp's tiles are half), so only the summation order differs from the matvec
+kernels: the oracle comparison is unchanged (84/84 on Metal, also with the tiled kernel
+forced on every prompt, `COLIBRI_TILED_MIN_BATCH=2`). Below about 20 rows the matvec
+kernel is faster (fewer tiles than GPU cores to fill). The default `--batch` went from 64
+to 512 with it, since longer chunks now pay off. 512-token prompt, prefill tok/s:
+
+| model | before (`--batch 64`) | tiled, `--batch 64` | tiled, `--batch 512` (default) | llama.cpp |
+|---|---|---|---|---|
+| Qwen3-0.6B Q8_0 | 2018 | 2504 | 5237 | 10712 |
+| Qwen3-4B Q4_K_M | 281 | 675 | 951 | 1625 |
+| OLMoE-1B-7B-0125-Instruct Q4_K_M | 619 | | 618 | 4080 |
+| Qwen3-30B-A3B Q4_K_M | 213 | | 227 | 1660 |
+
+The MoE models gain nothing yet: their time is in the routed expert matmuls
+(`matmul_id_*`, one token per pair), which a tiled routed kernel (llama.cpp's
+`mul_mm_id`, grouping each expert's tokens) would address. A version that decodes two
+units per step (64-wide K, 24 KB of threadgroup memory) was 5-7% slower: fewer
+threadgroups fit on a core.
 
 ## 4. Known gaps
 
