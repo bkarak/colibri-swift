@@ -21,8 +21,9 @@ import argparse, concurrent.futures as cf, glob, json, os, re, subprocess, sys, 
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 FIXTURES = os.path.join(REPO, 'Tests', 'ColibriCoreTests', 'Fixtures', 'oracle')
-REAL_GGUF = os.environ.get('COLIBRI_QWEN3_GGUF',
-                           os.path.expanduser('~/colibri-models/qwen3-0.6b/Qwen3-0.6B-Q8_0.gguf'))
+REAL_MODELS = json.load(open(os.path.join(REPO, 'scripts', 'oracle', 'real-models.json')))
+for _m in REAL_MODELS:
+    _m['path'] = os.environ.get(_m['env'], os.path.expanduser(_m['gguf']))
 
 
 def parse_ids(stderr, label):
@@ -114,6 +115,7 @@ def main():
     ap.add_argument('--cases', default='', help='comma-separated tiny case names (default: all)')
     ap.add_argument('--tiny-only', action='store_true')
     ap.add_argument('--real-only', action='store_true')
+    ap.add_argument('--real-models', default='', help='comma-separated keys from real-models.json (default: all present)')
     ap.add_argument('--ids', action='store_true', help='feed upstream prompt ids (--prompt-ids) instead of text')
     ap.add_argument('--near-tie', type=float, default=0.01)
     ap.add_argument('--jobs', type=int, default=4)
@@ -127,6 +129,7 @@ def main():
         a.threads = max(1, (os.cpu_count() or 4) // max(1, a.jobs))
     key = 'greedy_exact' if a.reference == 'exact' else 'greedy_default'
     only = set(filter(None, a.cases.split(',')))
+    only_real = set(filter(None, a.real_models.split(',')))
 
     jobs, problems = [], []
     if not a.real_only:
@@ -150,17 +153,23 @@ def main():
                 steps = p['steps_exact'] if a.reference == 'exact' else None
                 jobs.append(Job('%s#%d' % (name, i), gguf, p, fx['n_new'], p[key], steps))
     if not a.tiny_only and not only:
-        real = os.path.join(FIXTURES, 'qwen3-0.6b-q8_0.json')
-        if not os.path.exists(REAL_GGUF):
-            print('note: no %s, skipping the real model' % REAL_GGUF)
-        else:
+        for m in REAL_MODELS:
+            if only_real and m['key'] not in only_real:
+                continue
+            real = os.path.join(FIXTURES, m['key'] + '.json')
+            if not os.path.exists(m['path']):
+                print('note: no %s, skipping %s' % (m['path'], m['key']))
+                continue
+            if not os.path.exists(real):
+                print('note: no fixture %s (record.py --real --real-models %s)' % (real, m['key']))
+                continue
             fx = json.load(open(real))
-            if os.path.getsize(REAL_GGUF) != fx['model']['bytes']:
-                problems.append({'label': 'qwen3-0.6b', 'status': 'STALE', 'detail': 'file size differs from the fixture'})
-            else:
-                for p in fx['prompts']:
-                    steps = p['steps_exact'] if a.reference == 'exact' else None
-                    jobs.append(Job('qwen3-0.6b/' + p['name'], REAL_GGUF, p, fx['n_new'], p[key], steps))
+            if os.path.getsize(m['path']) != fx['model']['bytes']:
+                problems.append({'label': m['key'], 'status': 'STALE', 'detail': 'file size differs from the fixture'})
+                continue
+            for p in fx['prompts']:
+                steps = p['steps_exact'] if a.reference == 'exact' else None
+                jobs.append(Job(m['key'] + '/' + p['name'], m['path'], p, fx['n_new'], p[key], steps))
 
     print('coli-swift %s, backend %s, reference upstream %s (%s), %d runs, %d jobs'
           % (a.coli_swift, a.backend, a.reference, 'GQ_EXACT=1' if a.reference == 'exact' else 'int8 activations',

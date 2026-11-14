@@ -32,6 +32,10 @@ DIVERGED with the step.
 |---|---|---|---|
 | Qwen3-0.6B Q8_0, 5 prompts x 32 tokens | CPU | 5/5 | none |
 | Qwen3-0.6B Q8_0, 5 prompts x 32 tokens | Metal | 5/5 | none |
+| Qwen3-30B-A3B Q4_K_M, the same 5 prompts x 32 tokens (fixture recorded with `record.py --light`: greedy ids and prefill top-20 only; prefill logits within 5e-5) | CPU | 5/5 | none |
+| same | Metal | 5/5 | none |
+| same, experts streamed: `--expert-cache-gb 4` and `1` (31 and 8 of 128 slots per layer) | Metal | 5/5, 5/5 | none |
+| same, experts streamed: `--expert-cache-gb 2` | CPU | 5/5 | none |
 | 16 synthetic models x 4 prompts x 24 tokens (qwen3, qwen3moe, olmoe; F32, Q8_0, Q4_K, Q4_K_M mix, tied head, Qwen vocabulary) | CPU | 64/64 | none |
 | same | Metal | 64/64 | none |
 | same, f16 KV cache | Metal | 68/69 with Qwen3-0.6B | `olmoe_q4_K` prompt 3, step 18: picked upstream's second token, upstream's gap 0.0038 (7.32823 vs 7.32444): a near-tie |
@@ -87,14 +91,29 @@ Before the split-KV attention kernel (one threadgroup per head) these were 110 t
 512 tokens and 70 after 2048. During decode the GPU is busy about 93% of the wall time, so
 the remaining cost is in the kernels, not in host round trips.
 
-No MoE model large enough to measure streaming throughput exists on this machine; the
-synthetic models only show that the cache works (counts, evictions), not how fast.
+Qwen3-30B-A3B Q4_K_M, 512-token prompt, 128 generated tokens, `--batch 64`, median of 2:
+Metal resident 222 tok/s prefill, 84 decode; CPU resident 32 and 10.7. Streamed on Metal
+with `--direct` (128 tokens of `generate`): 29.9 / 27.0 / 25.4 tok/s decode with 8 / 4 / 2 GB
+caches. Those reads came from the file cache (24-56 GB/s), not the SSD: `F_NOCACHE` does not
+evict pages already cached, and the whole file was. A disk-bound measurement needs
+`sudo purge` before the run; it has not been done.
 
 ## 4. Known gaps
 
-**Not run on real MoE weights.** `qwen3moe` and `olmoe` are verified only on synthetic
-GGUFs that use the real tensor layout. The first real Qwen3-30B-A3B or OLMoE run should
-compare CPU against Metal and resident against `--expert-cache-gb` as in section 2.
+**OLMoE not run on real weights.** `qwen3moe` has been run on the real Qwen3-30B-A3B
+(section 2); `olmoe` is verified only on synthetic GGUFs that use the real tensor layout.
+
+**First prompt on Metal.** The first forward of a process takes about 2 s longer on
+Qwen3-30B-A3B (0.1 s on Qwen3-0.6B), also when the experts are streamed. Most likely the
+GPU's first touch of the whole-file buffer (17 GB); not profiled. A residency set
+(`MTLResidencySet`, upstream `COLI_METAL_RESSET`) at load, or wrapping only the dense
+ranges when experts stream, would move or remove it.
+
+**Free memory differs from upstream on purpose.** `MemoryBudget.availableBytes` is
+physical memory minus anonymous, wired and compressed pages (Activity Monitor's "memory
+used"), so the file cache counts as available. Upstream's free + inactive + purgeable made
+a second CPU run of Qwen3-30B-A3B, right after a resident Metal run had cached the file,
+stream its experts through a 12.8 GB cache on a machine with 64 GB.
 
 **`--int8` is not bit-identical to upstream's int8 path.** Prefill logits of the
 synthetic models against upstream's default (int8-activation) path, per prompt: about half

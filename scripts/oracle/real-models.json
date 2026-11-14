@@ -1,0 +1,6 @@
+[
+  {"key": "qwen3-0.6b-q8_0", "arch": "qwen3", "engine": "qwen36", "vocab": 151936,
+   "gguf": "~/colibri-models/qwen3-0.6b/Qwen3-0.6B-Q8_0.gguf", "env": "COLIBRI_QWEN3_GGUF"},
+  {"key": "qwen3-30b-a3b-q4_k_m", "arch": "qwen3moe", "engine": "qwen36", "vocab": 151936,
+   "gguf": "~/colibri-models/qwen3-30b-a3b/Qwen3-30B-A3B-Q4_K_M.gguf", "env": "COLIBRI_QWEN3MOE_GGUF"}
+]

@@ -26,8 +26,12 @@ public struct MemoryBudget: Sendable {
     /// Physical memory.
     public static var physicalBytes: Int { Int(ProcessInfo.processInfo.physicalMemory) }
 
-    /// Free + inactive + purgeable from `host_statistics64`; nil if it reads as
-    /// unmeasured (under 2% of physical memory), as upstream treats it.
+    /// Memory not held by app (anonymous) pages, wired pages or the compressor, from
+    /// `host_statistics64`: physical minus Activity Monitor's "memory used". The file
+    /// cache counts as available, unlike upstream's free + inactive + purgeable: with
+    /// zero-copy weights the model's own cached pages are its storage, so counting them
+    /// as used made a second run of a model that had just been resident fall back to
+    /// streaming. nil if it reads as unmeasured (under 2% of physical memory).
     public static func availableBytes() -> Int? {
         var info = vm_statistics64()
         var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64_data_t>.stride / MemoryLayout<integer_t>.stride)
@@ -38,8 +42,9 @@ public struct MemoryBudget: Sendable {
         }
         guard kr == KERN_SUCCESS else { return nil }
         let page = Int(vm_kernel_page_size)
-        let pages = Int(info.free_count) + Int(info.inactive_count) + Int(info.purgeable_count)
-        let bytes = pages * page
+        let anonymous = max(0, Int(info.internal_page_count) - Int(info.purgeable_count))
+        let used = (anonymous + Int(info.wire_count) + Int(info.compressor_page_count)) * page
+        let bytes = max(0, physicalBytes - used)
         guard bytes >= physicalBytes / 50 else { return nil }
         return bytes
     }

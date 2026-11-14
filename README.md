@@ -76,7 +76,7 @@ Main options (`coli-swift --help` lists all):
 | `--temp`, `--top-p`, `--top-k`, `--seed` | sampling; `--temp 0` (default) is greedy |
 | `--max-tokens N`, `--ctx N`, `--batch N` | tokens to generate, KV capacity, largest prefill chunk |
 | `--kv f32\|f16` | KV cache element type (default f32) |
-| `--experts auto\|resident\|stream`, `--expert-cache-gb G` | expert placement and cache budget |
+| `--experts auto\|resident\|stream`, `--expert-cache-gb G`, `--direct` | expert placement, cache budget, uncached (`F_NOCACHE`) expert reads |
 | `--raw`, `--system`, `--think` | template control |
 | `--int8` | CPU only: upstream's default int8-activation matmuls instead of the float path |
 | `--dump`, `--dump-logits PATH`, `--prompt-ids`, `--ignore-eos` | oracle and debugging aids |
@@ -97,10 +97,10 @@ it. Metal also refuses, at load, shapes its kernels do not handle (attention hea
 256 or not a multiple of 4, a matrix row length not a multiple of 32, more than 2048 router
 experts); with `--backend auto` such a model runs on the CPU instead.
 
-Only Qwen3-0.6B (Q8_0) was run as a real model during the port. The MoE families were
-verified on small random GGUFs written by `Sources/ColibriCore/Synthetic/TinyModel.swift`
-with the real tensor layout, and against upstream on the same files (below). A real
-Qwen3-30B-A3B or OLMoE file has not been run yet.
+Two real models have been run against upstream: Qwen3-0.6B (Q8_0, dense) and
+Qwen3-30B-A3B (Q4_K_M, MoE, 128 experts, top 8). All three families were also verified on
+small random GGUFs written by `Sources/ColibriCore/Synthetic/TinyModel.swift` with the real
+tensor layout (below). A real OLMoE file has not been run yet.
 
 ## Verification
 
@@ -112,6 +112,8 @@ runs `coli-swift generate` on every fixture prompt and reports the first diverge
 | check | CPU | Metal |
 |---|---|---|
 | Qwen3-0.6B Q8_0 vs upstream: 5 prompts (chat, raw English, raw Python, Greek with a system message) x 32 tokens | 5/5 match | 5/5 match |
+| Qwen3-30B-A3B Q4_K_M vs upstream: the same 5 prompts x 32 tokens (prefill top-20 logits within 5e-5) | 5/5 match | 5/5 match |
+| Qwen3-30B-A3B with streamed experts: caches of 4 and 1 GB (Metal; 31 and 8 of 128 slots per layer) and 2 GB (CPU) | 5/5 match | 5/5 match |
 | synthetic qwen3, qwen3moe, olmoe vs upstream: 16 models (F32, Q8_0, Q4_K, Q4_K_M, tied head, Qwen vocabulary) x 4 prompts x 24 tokens | 64/64 match | 64/64 match |
 | same, f16 KV cache | | 68/69 match, 1 near-tie (`olmoe_q4_K` prompt 3, step 18: upstream's own top-2 gap 0.0038) |
 | same MoE models with streamed experts, cache smaller than the experts (`--expert-cache-gb 0.001`: 4 of 16 or 2-4 of 8 slots per layer) | 64/64 match | 64/64 match (also with `--batch 4`) |
@@ -126,7 +128,7 @@ runs `coli-swift generate` on every fixture prompt and reports the first diverge
 On top of that, `swift test` checks every block decoder bit for bit against upstream's,
 the tokenizer against upstream's prompt ids, the prefill logits and greedy ids of three
 synthetic models against upstream's (all 16 with `COLIBRI_ORACLE_FULL=1`, Qwen3-0.6B with
-`COLIBRI_ORACLE_REAL=1`; tolerance 2e-3, typically about 1e-5), resident against streamed
+`COLIBRI_ORACLE_REAL=1`, which also runs Qwen3-30B-A3B when its file is present; tolerance 2e-3, typically about 1e-5), resident against streamed
 experts, every Metal kernel against the CPU backend for every weight type, and the
 failure modes above.
 
@@ -134,7 +136,12 @@ failure modes above.
 scripts/oracle/compare.sh                                   # CPU, all cases
 scripts/oracle/compare.sh --backend metal
 scripts/oracle/compare.sh --backend metal --tiny-only -- --expert-cache-gb 0.001
+scripts/oracle/compare.sh --backend metal --real-only --real-models qwen3-30b-a3b-q4_k_m -- --expert-cache-gb 1
 ```
+
+The real models the harness knows are listed in `scripts/oracle/real-models.json`; adding
+one there and running `record.py --real --real-models <key>` records upstream's outputs
+for it (`--light` for big models: one run per prompt instead of one per step).
 
 ## Performance
 
@@ -149,7 +156,22 @@ prompt then 128 generated tokens, median of 3 runs
 | CPU, float path (the reference) | 345 | 37.5 |
 | CPU, `--int8` | 759 | 67.5 |
 
-With a short prompt Metal decodes at about 233 tok/s; after a 2048-token prompt, at about
+Qwen3-30B-A3B Q4_K_M (17.3 GiB, 3.3B active parameters per token), same machine and settings
+but the default `--batch 64` and 2 runs:
+
+| backend, experts | prefill tok/s | decode tok/s |
+|---|---|---|
+| Metal, resident (zero-copy, 16.35 GiB of experts) | 222 | 84 |
+| CPU, resident | 32 | 10.7 |
+| Metal, streamed through an 8 / 4 / 2 GB cache, `--direct` (128 tokens of `generate`) | | 29.9 / 27.0 / 25.4 |
+
+The streamed rows were measured with the whole file already in the macOS file cache, so
+the reads came from RAM (24-56 GB/s), not the SSD: `F_NOCACHE` does not drop pages that are
+already cached. For a disk-bound number run `sudo purge` first. The first prompt of a
+process pays about 2 s once on this model (0.1 s on Qwen3-0.6B), most likely the GPU's
+first touch of the whole-file buffer; `bench` warms up first and hides it.
+
+With a short prompt Metal decodes Qwen3-0.6B at about 233 tok/s; after a 2048-token prompt, at about
 194. The GPU is busy for about 93% of the wall time during decode. There is no comparison
 with upstream's speed: its macOS build here has no OpenMP, so it runs on one core.
 

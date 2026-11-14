@@ -2,7 +2,7 @@
 """Record upstream colibri's greedy outputs as fixtures for the Swift port.
 
 Runs the upstream C engines (built by build-upstream.sh) on
-  * the real Qwen3-0.6B-Q8_0 GGUF, 5 fixed prompts      -> Fixtures/oracle/qwen3-0.6b-q8_0.json
+  * each real GGUF in real-models.json, 5 fixed prompts -> Fixtures/oracle/<key>.json
   * the synthetic tiny GGUFs written by TinyModel        -> Fixtures/oracle/tiny/<case>.json
 and stores, per prompt: the prompt ids, the greedy ids with the float reference matmul
 (GQ_EXACT=1, what an f32-dequantising port should reproduce) and with upstream's default
@@ -15,6 +15,7 @@ Python standard library only. Run with `python3 -I`:
   python3 -I scripts/oracle/record.py                 # everything
   python3 -I scripts/oracle/record.py --tiny --skip-generate --cases olmoe_f32
   python3 -I scripts/oracle/record.py --real
+  python3 -I scripts/oracle/record.py --real --real-models qwen3-30b-a3b-q4_k_m
 
 Recipe and flags: docs/port/models.md section 10 and scripts/oracle/README.md.
 """
@@ -23,8 +24,10 @@ import argparse, array, concurrent.futures as cf, json, os, shutil, subprocess, 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 FIXTURES = os.path.join(REPO, 'Tests', 'ColibriCoreTests', 'Fixtures', 'oracle')
 ORACLE_DIR = os.environ.get('ORACLE_DIR', os.path.join(os.environ.get('TMPDIR', '/tmp'), 'colibri-oracle'))
-REAL_GGUF = os.environ.get('COLIBRI_QWEN3_GGUF',
-                           os.path.expanduser('~/colibri-models/qwen3-0.6b/Qwen3-0.6B-Q8_0.gguf'))
+REAL_MODELS = json.load(open(os.path.join(REPO, 'scripts', 'oracle', 'real-models.json')))
+for _m in REAL_MODELS:
+    _m['path'] = os.environ.get(_m['env'], os.path.expanduser(_m['gguf']))
+REAL_GGUF = REAL_MODELS[0]['path']  # the tiny *_qwenvocab models copy this file's tokenizer
 UPSTREAM_COMMIT = '0a5504a'
 
 TINY_NEW = 24
@@ -282,42 +285,56 @@ def record_tiny(up, models_dir, only, pool):
         log('[record] %-28s %5.1fs  %s' % (name, time.time() - t0, ' | '.join(' '.join(map(str, p['greedy_exact'][:8])) for p in prompts)))
 
 
-def record_real(up, pool):
-    if not os.path.exists(REAL_GGUF):
-        log('[record] no %s, skipping the real model' % REAL_GGUF)
-        return
-    vocab = 151936
-    prompts = []
-    for name, text in REAL_PROMPTS:
-        t0 = time.time()
-        pids = up.tokenize(REAL_GGUF, text)
-        ids, rows = up.steps('qwen36', REAL_GGUF, pids, REAL_NEW, vocab, pool=pool)
-        ids_default, pre_default = up.generate('qwen36', REAL_GGUF, pids, 1, exact=False, dump=True)
-        ids_default, _ = up.generate('qwen36', REAL_GGUF, pids, REAL_NEW, exact=False)
-        prompts.append({'name': name, 'text': text, 'prompt_ids': pids,
-                        'greedy_exact': ids, 'greedy_default': ids_default,
-                        'steps_exact': step_records(ids, rows),
-                        'prefill_top_exact': top(rows[0], REAL_PREFILL_TOP),
-                        'prefill_top_default': top(pre_default, REAL_PREFILL_TOP)})
-        log('[record] real %-18s %5.1fs  %d prompt ids -> %s' % (name, time.time() - t0, len(pids), ' '.join(map(str, ids))))
-    st = os.stat(REAL_GGUF)
-    fixture = {
-        'model': {'file': os.path.basename(REAL_GGUF), 'bytes': st.st_size, 'architecture': 'qwen3', 'vocab_size': vocab},
-        'upstream': {'commit': UPSTREAM_COMMIT, 'engine': 'qwen36',
-                     'command': 'SNAP=<gguf> COLI_LOOKUP=0 GQ_EXACT=1 DUMP=<f32> ./qwen36 0 4 ref.json',
-                     'tokenize': 'SNAP=<gguf> TOK_ONLY=1 ./qwen36 0 4 prompt.txt', 'kv_cache': 'f32'},
-        'n_new': REAL_NEW, 'prompts': prompts,
-    }
-    os.makedirs(FIXTURES, exist_ok=True)
-    with open(os.path.join(FIXTURES, 'qwen3-0.6b-q8_0.json'), 'w') as f:
-        json.dump(fixture, f, ensure_ascii=False, indent=1)
-        f.write('\n')
+def record_real(up, pool, only, light=False):
+    for m in REAL_MODELS:
+        if only and m['key'] not in only:
+            continue
+        gguf, vocab = m['path'], m['vocab']
+        if not os.path.exists(gguf):
+            log('[record] no %s, skipping %s' % (gguf, m['key']))
+            continue
+        def one(item):
+            name, text = item
+            t0 = time.time()
+            pids = up.tokenize(gguf, text)
+            if light:
+                # One greedy run plus the prefill logits: no per-step logits, so a divergence
+                # cannot be told from a near tie without re-recording that prompt in full.
+                ids, _ = up.generate(m['engine'], gguf, pids, REAL_NEW, exact=True)
+                _, pre = up.generate(m['engine'], gguf, pids, 1, exact=True, dump=True)
+                rows = [pre]
+            else:
+                ids, rows = up.steps(m['engine'], gguf, pids, REAL_NEW, vocab, pool=pool)
+            ids_default, pre_default = up.generate(m['engine'], gguf, pids, 1, exact=False, dump=True)
+            ids_default, _ = up.generate(m['engine'], gguf, pids, REAL_NEW, exact=False)
+            log('[record] %s %-18s %6.1fs  %d prompt ids -> %s' % (m['key'], name, time.time() - t0, len(pids), ' '.join(map(str, ids))))
+            return {'name': name, 'text': text, 'prompt_ids': pids,
+                    'greedy_exact': ids, 'greedy_default': ids_default,
+                    'steps_exact': step_records(ids, rows),
+                    'prefill_top_exact': top(rows[0], REAL_PREFILL_TOP),
+                    'prefill_top_default': top(pre_default, REAL_PREFILL_TOP)}
+        # light: prompts in parallel (each run is single-threaded and slow); full: steps in parallel
+        prompts = list(pool.map(one, REAL_PROMPTS)) if light else [one(x) for x in REAL_PROMPTS]
+        st = os.stat(gguf)
+        fixture = {
+            'model': {'file': os.path.basename(gguf), 'bytes': st.st_size, 'architecture': m['arch'], 'vocab_size': vocab},
+            'upstream': {'commit': UPSTREAM_COMMIT, 'engine': m['engine'],
+                         'command': 'SNAP=<gguf> COLI_LOOKUP=0 GQ_EXACT=1 DUMP=<f32> ./qwen36 0 4 ref.json',
+                         'tokenize': 'SNAP=<gguf> TOK_ONLY=1 ./qwen36 0 4 prompt.txt', 'kv_cache': 'f32'},
+            'n_new': REAL_NEW, 'prompts': prompts, 'steps': 'prefill only' if light else 'every step',
+        }
+        os.makedirs(FIXTURES, exist_ok=True)
+        with open(os.path.join(FIXTURES, m['key'] + '.json'), 'w') as f:
+            json.dump(fixture, f, ensure_ascii=False, indent=1)
+            f.write('\n')
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--tiny', action='store_true', help='only the synthetic models')
-    ap.add_argument('--real', action='store_true', help='only Qwen3-0.6B')
+    ap.add_argument('--real', action='store_true', help='only the real models')
+    ap.add_argument('--light', action='store_true', help='real models: greedy ids and prefill logits only (one run per prompt instead of one per step)')
+    ap.add_argument('--real-models', default='', help='comma-separated keys from real-models.json (default: all present)')
     ap.add_argument('--cases', default='', help='comma-separated tiny case names')
     ap.add_argument('--models', default=os.path.join(ORACLE_DIR, 'tiny'), help='tiny model directory')
     ap.add_argument('--skip-generate', action='store_true', help='reuse the tiny models already in --models')
@@ -335,7 +352,7 @@ def main():
                     generate_tiny_models(a.models, a.scratch)
                 record_tiny(up, a.models, set(filter(None, a.cases.split(','))), pool)
             if a.real or both:
-                record_real(up, pool)
+                record_real(up, pool, set(filter(None, a.real_models.split(','))), a.light)
     finally:
         shutil.rmtree(up.tmp, ignore_errors=True)
 

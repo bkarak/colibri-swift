@@ -24,6 +24,7 @@ struct CLIOptions {
     var maxTokens: Int = 128
     var expertCacheGB: Double?
     var experts: ExpertStoreOptions.Mode = .auto
+    var directIO = false
     var prompt: String?
     var context: Int = 4096
     var raw = false
@@ -72,6 +73,7 @@ struct CLIOptions {
       --max-tokens N           tokens to generate (default 128)
       --expert-cache-gb G      RAM budget for routed experts; smaller than the experts forces streaming
       --experts auto|resident|stream   expert placement (default auto)
+      --direct                 streamed experts read with F_NOCACHE, from the SSD and not the file cache
       --prompt TEXT            prompt for generate/bench
       --ctx N                  KV cache capacity in tokens (default 4096)
       --raw                    no chat template (prompt is passed through)
@@ -128,6 +130,7 @@ struct CLIOptions {
             case "--seed": o.seed = try number(a, UInt64.self)
             case "--max-tokens": o.maxTokens = try number(a, Int.self)
             case "--expert-cache-gb": o.expertCacheGB = try number(a, Double.self)
+            case "--direct": o.directIO = true
             case "--experts":
                 let v = try value(a)
                 guard let m = ExpertStoreOptions.Mode(rawValue: v) else { throw ParseError(description: "--experts: auto, resident or stream, not \(v)") }
@@ -181,6 +184,7 @@ struct CLIOptions {
     var expertOptions: ExpertStoreOptions {
         var e = ExpertStoreOptions(mode: experts)
         if let gb = expertCacheGB { e.cacheBytes = Int(gb * 1_073_741_824) }
+        e.uncached = directIO
         return e
     }
 

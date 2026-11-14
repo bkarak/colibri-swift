@@ -228,4 +228,22 @@ enum Oracle {
         }
         for m in failures { Issue.record(Comment(rawValue: m)) }
     }
+
+    /// The real MoE model (18.6 GB, `COLIBRI_QWEN3MOE_GGUF` or the default download path).
+    /// Its fixture was recorded in light mode: greedy ids and prefill logits only.
+    static var qwen3MoEPath: String {
+        ProcessInfo.processInfo.environment["COLIBRI_QWEN3MOE_GGUF"]
+            ?? NSHomeDirectory() + "/colibri-models/qwen3-30b-a3b/Qwen3-30B-A3B-Q4_K_M.gguf"
+    }
+
+    @Test(.enabled(if: Oracle.real && FileManager.default.fileExists(atPath: OracleTests.qwen3MoEPath)))
+    func engineMatchesUpstreamOnQwen3_30B_A3B() throws {
+        let f = try Oracle.load("qwen3-30b-a3b-q4_k_m.json")
+        var failures: [String] = []
+        for p in f.prompts {
+            guard let o = try Oracle.run(path: Self.qwen3MoEPath, prompt: p.promptIds, steps: f.nNew) else { return }
+            failures += Oracle.compare("qwen3-30b-a3b/\(p.name ?? "?")", p, o, tolerance: Oracle.realLogitTolerance)
+        }
+        for m in failures { Issue.record(Comment(rawValue: m)) }
+    }
 }

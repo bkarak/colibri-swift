@@ -12,7 +12,8 @@ Everything here uses the system `python3` with the standard library only (run as
 | file | what it does |
 |---|---|
 | `build-upstream.sh` | copies upstream `c/` to `$ORACLE_DIR/c` (default `${TMPDIR:-/tmp}/colibri-oracle`) and runs `make qwen36 olmoe` (single-threaded, no libomp). `--force` rebuilds. |
-| `record.py` | writes the tiny models, runs upstream on them and on Qwen3-0.6B, and writes the fixtures. Only needed when the generator, the prompts or upstream change. |
+| `record.py` | writes the tiny models, runs upstream on them and on the real models, and writes the fixtures. Only needed when the generator, the prompts or upstream change, or for a new real model. |
+| `real-models.json` | the real GGUFs the harness knows: fixture key, architecture, upstream engine, default path and the env var that overrides it. A model whose file is absent is skipped. |
 | `compare.sh` | builds `coli-swift` (release), writes the tiny models if missing, and runs `compare.py`. |
 | `compare.py` | runs `coli-swift generate` on every fixture prompt and reports, per case, MATCH or the first divergence. |
 
@@ -61,6 +62,17 @@ byte. The qwenvocab cases are skipped when `~/colibri-models/qwen3-0.6b/Qwen3-0.
   for the byte-vocabulary olmoe models they are the bytes, with `|||IP_ADDRESS|||` as 256.
 - Each prompt is also run without `GQ_EXACT` (upstream's default int8-activation path) for
   `greedy_default`.
+
+## Real models
+
+`record.py --real --real-models <key>` runs upstream on the five fixed prompts of every listed
+model present (`Fixtures/oracle/<key>.json`); `compare.py --real-only --real-models <key>`
+checks coli-swift against it. Upstream's macOS build is single-threaded, so recording every
+step's logits (one run per step count) is slow for a large model: `--light` records the
+greedy ids from one run plus the prefill logits, and runs the prompts in parallel (`--jobs`;
+each qwen36 process held about 8.7 GB on Qwen3-30B-A3B, so keep jobs x that under RAM). A
+divergence then cannot be told from a near tie without re-recording that prompt in full.
+Qwen3-30B-A3B Q4_K_M took about 6 minutes with `--light --jobs 5`.
 
 ## Fixtures
 
