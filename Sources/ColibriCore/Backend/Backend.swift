@@ -478,9 +478,13 @@ public protocol Backend: AnyObject {
     func matmul(_ w: WeightView, _ x: BufferSlice, into y: BufferSlice, batch: Int)
 
     /// Two products of the same input (a SwiGLU gate and up projection): a backend may
-    /// fuse them into one pass over `x`. Default: two `matmul`s.
+    /// fuse them into one pass over `x`. Default: `matmulGroup` of the two.
     func matmulPair(_ w0: WeightView, _ w1: WeightView, _ x: BufferSlice,
                     into y0: BufferSlice, _ y1: BufferSlice, batch: Int)
+
+    /// Products of the same input with several matrices of equal `cols` (q, k and v): a
+    /// backend may run them as one pass. Default: one `matmul` each, in order.
+    func matmulGroup(_ ws: [WeightView], _ x: BufferSlice, into ys: [BufferSlice], batch: Int)
 
     /// Indexed (routed) matrix product, llama.cpp's `mul_mv_id`. `indices` holds
     /// `rows * perRow` Int32 values; for row `s` and pick `k`, with `i = indices[s * perRow + k]`:
@@ -550,7 +554,11 @@ extension Backend {
 
     public func matmulPair(_ w0: WeightView, _ w1: WeightView, _ x: BufferSlice,
                            into y0: BufferSlice, _ y1: BufferSlice, batch: Int) {
-        matmul(w0, x, into: y0, batch: batch)
-        matmul(w1, x, into: y1, batch: batch)
+        matmulGroup([w0, w1], x, into: [y0, y1], batch: batch)
+    }
+
+    public func matmulGroup(_ ws: [WeightView], _ x: BufferSlice, into ys: [BufferSlice], batch: Int) {
+        precondition(ws.count == ys.count, "matmulGroup: \(ws.count) matrices, \(ys.count) outputs")
+        for (w, y) in zip(ws, ys) { matmul(w, x, into: y, batch: batch) }
     }
 }

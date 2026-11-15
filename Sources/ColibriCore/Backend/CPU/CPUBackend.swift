@@ -1,9 +1,10 @@
+import CColibriKernels
 import Foundation
 
-/// The reference backend: eager execution on the CPU, parallelised with
-/// `DispatchQueue.concurrentPerform` over chunks of output rows (never nested, never
-/// spinning; see docs/port/runtime-and-metal.md section 6.6). Every other backend is
-/// tested against this one.
+/// The reference backend: eager execution on the CPU, parallelised over chunks of output
+/// rows on a spinning worker pool (`Parallel`, CColibriKernels/pool.c; never nested; see
+/// docs/port/runtime-and-metal.md section 6.6). Every other backend is tested against
+/// this one.
 ///
 /// Numerics follow upstream colibri (olmoe.c / qwen36.c, docs/port/models.md sections 4
 /// and 5): RMSNorm sums squares in Double, RoPE angles are Float32 `powf`/`cosf`/`sinf`,
@@ -13,7 +14,7 @@ import Foundation
 /// weights to upstream's default int8-activation path.
 public final class CPUBackend: Backend {
     public let capabilities: BackendCapabilities
-    /// Worker count for `concurrentPerform` splits (`--threads`; default: active cores).
+    /// Worker count for the parallel loops (`--threads`; default: performance cores).
     public let threads: Int
     /// Use the int8-activation integer path (upstream's default) for block-quantised
     /// weights instead of the float path.
@@ -22,7 +23,7 @@ public final class CPUBackend: Backend {
     private let q8 = Q8Activations()
 
     public init(threads: Int? = nil, integerActivations: Bool = false) {
-        let n = threads ?? ProcessInfo.processInfo.activeProcessorCount
+        let n = threads ?? Parallel.performanceCores
         self.threads = max(1, n)
         self.integerActivations = integerActivations
         self.capabilities = BackendCapabilities(
@@ -83,6 +84,10 @@ public final class CPUBackend: Backend {
 
     /// Rows per work item for a matrix of `rows` outputs: about four items per worker,
     /// at least 16 rows.
+    /// Matmul chunks per worker: enough that the last chunks of a loop are short (the
+    /// rows kernel takes 4 rows per pass, so chunks are multiples of 4).
+    static let chunksPerThread = Int(ProcessInfo.processInfo.environment["COLIBRI_CPU_CHUNKS"] ?? "") ?? 4
+
     private func rowChunk(_ rows: Int) -> Int {
         max(16, (rows + threads * 4 - 1) / (threads * 4))
     }
@@ -96,7 +101,15 @@ public final class CPUBackend: Backend {
     private func rowsProduct(_ type: GGMLType, base: UnsafeRawPointer, rowBytes: Int, cols: Int, range: Range<Int>,
                              scale: Float, x: UnsafePointer<Float>, xRow0: Int, batch: Int,
                              y: UnsafeMutablePointer<Float>, yStride: Int, integer: Bool) {
-        if integer && batch > 1 && type != .q8_0 {
+        if integer && Dot.hasRowKernel(type) {
+            // NEON rows kernel: four weight rows per pass, bit-identical to `dotQ8`.
+            for s in 0..<batch {
+                let (xq, dx, xs) = q8.row(xRow0 + s)
+                colibri_rows_i8(Int32(type.rawValue), base.assumingMemoryBound(to: UInt8.self) + range.lowerBound * rowBytes,
+                                rowBytes, Int32(range.count), xq, dx, xs, Int32(cols), scale,
+                                y + s * yStride + range.lowerBound)
+            }
+        } else if integer && batch > 1 && type != .q8_0 {
             // Unpack each row once for the whole batch (Q8_0's codes are already int8).
             let nu = cols / 16
             withUnsafeTemporaryAllocation(of: Int8.self, capacity: cols) { w8b in
@@ -151,10 +164,47 @@ public final class CPUBackend: Backend {
         if integer { q8.quantize(xp, rows: batch, cols: w.cols) }
         let base = w.rowPointer(0), rb = w.rowBytes, type = w.type, cols = w.cols, scale = w.scale, rows = w.rows
         let ctx = UnsafeSendable((base, xp, yp))
-        Parallel.forChunks(rows, threads: threads, minChunk: rowChunk(rows)) { range in
+        Parallel.forChunks(rows, threads: threads, minChunk: 8, perThread: Self.chunksPerThread, align: 4) { range in
             let (base, xp, yp) = ctx.value
             rowsProduct(type, base: base, rowBytes: rb, cols: cols, range: range, scale: scale,
                         x: xp, xRow0: 0, batch: batch, y: yp, yStride: rows, integer: integer)
+        }
+    }
+
+    /// One parallel loop over the rows of every matrix (the activations quantised once):
+    /// a decode step's q/k/v and gate/up are each one loop instead of three and two. Each
+    /// output row is computed exactly as `matmul` computes it.
+    public func matmulGroup(_ ws: [WeightView], _ x: BufferSlice, into ys: [BufferSlice], batch: Int) {
+        precondition(ws.count == ys.count, "matmulGroup: \(ws.count) matrices, \(ys.count) outputs")
+        guard ws.count > 1, ws.allSatisfy({ $0.cols == ws[0].cols }) else {
+            for (w, y) in zip(ws, ys) { matmul(w, x, into: y, batch: batch) }
+            return
+        }
+        let cols = ws[0].cols
+        for (w, y) in zip(ws, ys) {
+            precondition(x.count >= batch * cols && y.count >= batch * w.rows, "matmulGroup: slice too small")
+            precondition(w.offset >= 0 && w.offset + w.byteCount <= w.region.length, "matmulGroup: weight outside its region")
+        }
+        let xp = UnsafePointer(f32(x))
+        let integer = ws.map { useInteger($0.type, cols: cols) }
+        if integer.contains(true) { q8.quantize(xp, rows: batch, cols: cols) }
+        // Chunks of `per` rows (a multiple of 4) dealt out matrix by matrix.
+        let total = ws.reduce(0) { $0 + $1.rows }
+        let target = max(1, threads * Self.chunksPerThread)
+        let per = max(8, ((total + target - 1) / target + 3) / 4 * 4)
+        var items: [(m: Int, lo: Int, hi: Int)] = []
+        for (m, w) in ws.enumerated() {
+            var lo = 0
+            while lo < w.rows { items.append((m, lo, min(w.rows, lo + per))); lo += per }
+        }
+        let mats = ws.map { (base: $0.rowPointer(0), rb: $0.rowBytes, type: $0.type, scale: $0.scale, rows: $0.rows) }
+        let outs = ys.map { f32($0) }
+        let ctx = UnsafeSendable((xp, outs, mats, items, integer))
+        Parallel.forEach(items.count, threads: threads) { i in
+            let (xp, outs, mats, items, integer) = ctx.value
+            let it = items[i], w = mats[it.m]
+            rowsProduct(w.type, base: w.base, rowBytes: w.rb, cols: cols, range: it.lo ..< it.hi, scale: w.scale,
+                        x: xp, xRow0: 0, batch: batch, y: outs[it.m], yStride: w.rows, integer: integer[it.m])
         }
     }
 

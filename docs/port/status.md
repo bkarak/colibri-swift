@@ -149,10 +149,62 @@ Where the gap most likely comes from (from how llama.cpp is built; not profiled 
 - **CPU (5-7x).** llama.cpp quantises activations to 8 bits and uses the NEON int8
   dot-product and matrix instructions (`sdot`, `smmla`), plus Accelerate for large prompt
   batches. coli-swift's default CPU path dequantises every weight to fp32 to stay
-  bit-close to upstream's float reference; its `--int8` path uses `sdot` but still does
-  the per-16 scaling in scalar floats, and runs MoE expert rows one token at a time.
-  llama.cpp's CPU decode is close to coli-swift's Metal decode. (Measured before the
-  `--int8` fix below; the float path is unchanged.)
+  bit-close to upstream's float reference; its `--int8` path used `sdot` but did the
+  per-16 scaling in scalar floats. (Measured before the CPU decode work below, which
+  brought `--int8` decode level with llama.cpp.)
+
+### CPU decode: rows kernel and worker pool
+
+Three changes, measured on Qwen3-4B `--int8` decode (15.7 tok/s before):
+
+1. **Worker pool** (`CColibriKernels/pool.c`, used by `Parallel`). A decode step is about
+   250 parallel loops of 10-150 us each. `concurrentPerform` parked its workers between
+   them and paid to wake them every loop: replaying one token's matmuls in C held them to
+   about 20 tok/s with Dispatch and 31-34 with workers that spin between loops (then
+   sleep after 3 ms idle). Chunks are claimed through one atomic tagged with the loop's
+   generation. The default `--threads` is now the performance-core count: 16 threads,
+   with spinning workers on the efficiency cores, halved the speed (llama.cpp shows the
+   same collapse at `-t 16`).
+2. **Rows kernel** (`CColibriKernels/rows_i8.c`, Q4_0, Q4_1, Q8_0, Q2_K-Q6_K). The
+   int8 codes are decoded from the packed block in registers (no unpack buffer), four
+   weight rows share each activation load, the integer sums are `sdot` plus a pairwise
+   add tree, and `dotQ8`'s float steps run with one row per vector lane, in its order,
+   with contraction off. Per row the result is bit-identical to `dotQ8`
+   (`QuantTests.rowKernelIsBitIdentical`, encoder output and random bytes). What made it
+   fast, single thread, streaming from memory (Q4_K / Q6_K GB/s): first version 10 / 14;
+   scales built across the four rows in vector lanes 11.6 / 16.5; scale vectors built in
+   registers instead of through small stack arrays (store-to-load forwarding stalls)
+   19.1 / 17.1; the per-block pair loop fully unrolled 24.2 / 25.1. Twelve threads
+   reach 186 GB/s on a large Q4_K matrix, the memory bandwidth. SwiftPM compiles C at
+   `-Os`, which left the helpers out of line; the target now uses `-O3` in release.
+3. **One loop per shared input** (`Backend.matmulGroup`): q/k/v and gate/up are one
+   parallel loop each on the CPU, rows identical to separate `matmul`s
+   (`CPUBackendTests.matmulGroupMatchesSeparateMatmuls`).
+
+The oracle results are unchanged: float path 84/84, `--int8` 70/84 with the same 14
+divergences as before (section 2).
+
+CPU, 512-token prompt, 128 generated tokens, median of 3 (tok/s, prefill / decode):
+
+| model | float before | float now | `--int8` before | `--int8` now |
+|---|---|---|---|---|
+| Qwen3-0.6B Q8_0 | 345 / 37.5 | 345 / 157 | 759 / 67.5 | 915 / 192 |
+| Qwen3-4B Q4_K_M | 44.6 / 10.7 | 45.5 / 14.9 | 54.8 / 15.7 | 90.6 / 55.1 |
+| OLMoE-1B-7B Q4_K_M | 81 / 28.9 | 69 / 41 | | 273-296 / 114-164 |
+| Qwen3-30B-A3B Q4_K_M | 32 / 10.7 | 26 / 12.7 | | 101-103 / 44.5 |
+
+Against llama.cpp CPU decode at depth 512, interleaved runs (`-t 12`, tok/s, coli-swift
+`--int8` / llama.cpp): Qwen3-4B 53.5 / 50.9 and 51.1 / 46.5, OLMoE 113.5 / 102,
+Qwen3-30B-A3B 44.6 / 29.9 / 44.3. Another session's jobs kept the load average at 15-40
+during these runs, and both engines vary by up to 30% run to run; spinning-worker
+engines suffer when a worker is preempted, llama.cpp (static row split) more than
+coli-swift (chunks claimed dynamically). On a quiet machine the day before, llama.cpp
+decoded at 220 (0.6B), 67.4 (4B), 199 (OLMoE) and 69.3 (30B); coli-swift has not been
+measured on a quiet machine since. Qwen3-235B-A22B streamed, 64-token prompt, 32 tokens:
+`--int8` 1.3-1.9 tok/s, float 1.1, llama.cpp 1.66, all bound by expert reads.
+
+The float path (default, upstream's exact reference) gained only from the pool: its
+kernels dequantise to fp32 and multiply-add per weight, 2-4x the work of `sdot` on int8.
 
 ### Tiled prefill kernel
 
@@ -250,12 +302,13 @@ What this shows:
 - **Prefill is where coli-swift leads.** The tiled routed kernel processes each expert's
   tokens together, so a 512-token prompt reads each expert a few times (about 500 GB per
   run at 18 GB, almost all from the file cache at 30 GB/s), not once per token.
-- **CPU decode is compute-bound,** 0.5-0.6 s per token at every cache size, consistent
+- **CPU decode was compute-bound** (float path, before the CPU decode work above), 0.5-0.6 s per token at every cache size, consistent
   with the float kernels' speed on the 30B (22B active parameters here against 3.3B).
   llama.cpp's CPU kernels are 5-7x faster on resident models (above), and here that
   makes its CPU decode the fastest configuration of all.
-- **`--int8` is slower than the float path on this model** (0.8 against 1.9 tok/s at
-  18 GB): unlike Q4_K, its Q2_K and Q3_K blocks have not been profiled on the int8 path.
+- **`--int8` was slower than the float path on this model** (0.8 against 1.9 tok/s at
+  18 GB) before the rows kernel, which covers Q2_K and Q3_K; it is now 1.3-1.9 against
+  the float path's 1.1 (section 3, CPU decode).
 
 ## 4. Known gaps
 

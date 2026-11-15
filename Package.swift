@@ -6,7 +6,7 @@
 import PackageDescription
 
 // The engine targets use the Swift 5 language mode. The compute code passes raw
-// pointers into `DispatchQueue.concurrentPerform` closures and keeps mutable caches in
+// pointers into parallel-loop closures (`Parallel`) and keeps mutable caches in
 // classes shared with I/O threads; Swift 6 strict concurrency would demand
 // `@unchecked Sendable` wrappers on nearly every hot-path type without adding safety
 // (the synchronisation is explicit: locks, conditions, Metal command completion).
@@ -31,8 +31,11 @@ let package = Package(
         .executable(name: "coli-swift", targets: ["coli-swift"]),
     ],
     targets: [
-        // NEON integer kernels Swift does not vectorise (static inline, no dependencies).
-        .target(name: "CColibriKernels"),
+        // NEON kernels and the CPU worker pool (C, no dependencies). Release builds use
+        // -O3: SwiftPM's default -Os for C left the per-type helpers of the rows kernel
+        // out of line, with the type switch evaluated per call.
+        .target(name: "CColibriKernels",
+                cSettings: [.unsafeFlags(["-O3"], .when(configuration: .release))]),
         .target(
             name: "ColibriCore",
             dependencies: ["CColibriKernels"],

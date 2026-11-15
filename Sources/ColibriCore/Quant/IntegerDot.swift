@@ -1,4 +1,5 @@
 import CColibriKernels
+import Foundation
 // The integer path: activations quantised to int8 per 32 values, weights unpacked to
 // int8 codes plus a scale and a min per 16, exact integer inner sums. Ported from
 // colibri c/ggml_quants.h (gq_quant_act_ref, gq_ublk, gq_dot_i8, gq_dot_q8_0);
@@ -221,6 +222,15 @@ enum IntegerForm {
 extension Dot {
     /// True when `dotQ8` handles `type` (every block type of the first port).
     public static func supportsInteger(_ type: GGMLType) -> Bool { IntegerForm.supports(type) }
+
+    /// Types with the C rows kernel (`colibri_rows_i8`, CColibriKernels/rows_i8.c): the
+    /// same bits as `dotQ8`, four rows per pass. `COLIBRI_NO_ROW_KERNEL=1` turns it off.
+    static let rowKernelTypes: Set<GGMLType> = {
+        if ProcessInfo.processInfo.environment["COLIBRI_NO_ROW_KERNEL"] == "1" { return [] }
+        return Set(GGMLType.allCases.filter { colibri_rows_i8_supported(Int32($0.rawValue)) != 0 })
+    }()
+
+    @inline(__always) public static func hasRowKernel(_ type: GGMLType) -> Bool { rowKernelTypes.contains(type) }
 
     /// Integer-path dot of one weight row with row `r` of `act` (`gq_dot_q8_0` for Q8_0,
     /// `gq_ublk` + `gq_dot_i8` for every other block type). `count == act.cols`.

@@ -65,7 +65,7 @@ struct CLIOptions {
     options:
       --model PATH             GGUF file (or the first positional argument)
       --backend auto|cpu|metal compute backend (default auto: Metal on Apple Silicon, CPU fallback)
-      --threads N              CPU worker threads (default: all cores)
+      --threads N              CPU worker threads (default: the performance cores)
       --temp T                 temperature, 0 = greedy (default 0)
       --top-p P                nucleus mass (default 1, off)
       --top-k K                keep the K most likely tokens (default 0, off)

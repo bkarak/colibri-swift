@@ -423,16 +423,23 @@ needed in v1: the KV is allocated at startup for `--ctx`.
 - Upstream's speculative "next group of 64" readahead does not apply (top-8
   never forms a second group).
 
-### 6.6 CPU compute: `DispatchQueue.concurrentPerform`
+### 6.6 CPU compute: a spinning worker pool
 
-- One flat `concurrentPerform` per operation, over **chunks of output rows**
-  (e.g. `rows / (activeProcessorCount * 4)`, at least 16 rows). Small chunks
-  let the 12 P-cores take work from the 4 E-cores, so no barrier waits for the
-  slowest core (upstream's reason for P-core-only OpenMP teams).
+- One flat parallel loop per operation, over **chunks of output rows** (about four
+  per worker; matmul chunks are multiples of 4 rows, the rows kernel's pass), claimed
+  dynamically. Matmuls that share an input (q/k/v, gate/up) are one loop
+  (`Backend.matmulGroup`).
 - In MoE, flatten `(expert, row-chunk)` pairs into one iteration space so the
   layer has one fork/join instead of one per expert.
-- Never nest `concurrentPerform`. Never spin; `concurrentPerform` blocks
-  passively.
+- The loops run on `CColibriKernels/pool.c`: workers spin between loops and sleep
+  after 3 ms without work. This replaced `DispatchQueue.concurrentPerform`, whose
+  workers parked between the ~250 short loops of a decode step (Qwen3-4B `--int8`
+  decode about 20 tok/s against 31-34 for the same kernels with spinning workers;
+  `docs/port/status.md` section 3). Default threads: the performance cores, since
+  spinning workers on the efficiency cores slow every loop (upstream's reason for
+  P-core-only OpenMP teams).
+- Never nest the loops; a nested call (or one made while another thread's loop runs)
+  runs serially.
 - Swift 6 strict concurrency: pass raw pointers through a small
   `struct UnsafeSendable<T>: @unchecked Sendable` wrapper; Metal objects stay
   confined to the engine thread.

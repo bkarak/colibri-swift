@@ -1,3 +1,4 @@
+import CColibriKernels
 import Foundation
 import Testing
 @testable import ColibriCore
@@ -276,6 +277,57 @@ func referenceDot(_ a: [Float], _ b: [Float], _ off: Int = 0) -> (value: Double,
             }
         }
         #expect(sc[2 * cols / 16] == 12345, "\(type): unpack wrote past cols / 16 mins")
+    }
+
+    /// The C rows kernel (`colibri_rows_i8`) gives `scale * dotQ8` bit for bit, for rows
+    /// from the encoder and for random bytes (every code and scale bit pattern) with sane
+    /// half-float scales, over 7 rows (a 4-row pass and a partial one) and two activations.
+    @Test func rowKernelCoversTheCommonTypes() {
+        #expect(Dot.rowKernelTypes == [.q4_0, .q4_1, .q8_0, .q2_K, .q3_K, .q4_K, .q5_K, .q6_K])
+    }
+
+    @Test(arguments: portTypes)
+    func rowKernelIsBitIdentical(_ type: GGMLType) throws {
+        guard Dot.hasRowKernel(type) else { return }
+        var rng = TestRNG(UInt64(type.rawValue) + 4242)
+        let cols = 1024, rows = 7, nact = 2
+        let rowBytes = type.rowBytes(cols)
+        var encoded: [UInt8] = []
+        for _ in 0..<rows { encoded += try Quantize.encode(rng.floats(cols, scale: 0.2), as: type) }
+        // Random bytes, half-float scale fields set to small positive values.
+        let halfFields: [Int] = [.q4_0: [0], .q4_1: [0, 2], .q8_0: [0], .q2_K: [80, 82], .q3_K: [108],
+                                 .q4_K: [0, 2], .q5_K: [0, 2], .q6_K: [208]][type] ?? []
+        var random = (0..<(rows * rowBytes)).map { _ in UInt8(truncatingIfNeeded: rng.next()) }
+        for blk in 0..<(rows * rowBytes / type.typeSize) {
+            for f in halfFields {
+                let h = Float16(Float(rng.next() % 1000 + 1) / 4096).bitPattern
+                random[blk * type.typeSize + f] = UInt8(h & 0xFF)
+                random[blk * type.typeSize + f + 1] = UInt8(h >> 8)
+            }
+        }
+        let x = rng.floats(nact * cols)
+        let act = Q8Activations()
+        x.withUnsafeBufferPointer { act.quantize($0.baseAddress!, rows: nact, cols: cols) }
+        let scale: Float = 0.75
+        for (label, data) in [("encoded", encoded), ("random", random)] {
+            data.withUnsafeBytes { raw in
+                let base = raw.baseAddress!
+                for r in 0..<nact {
+                    var y = [Float](repeating: .nan, count: rows + 1)
+                    y[rows] = 777
+                    let (xq, dx, xs) = act.row(r)
+                    y.withUnsafeMutableBufferPointer { yp in
+                        colibri_rows_i8(Int32(type.rawValue), base.assumingMemoryBound(to: UInt8.self), rowBytes,
+                                        Int32(rows), xq, dx, xs, Int32(cols), scale, yp.baseAddress!)
+                    }
+                    for o in 0..<rows {
+                        let want = scale * Dot.dotQ8(type, row: base + o * rowBytes, act, row: r)
+                        #expect(want.bitPattern == y[o].bitPattern, "\(type) \(label) act \(r) row \(o): \(want) vs \(y[o])")
+                    }
+                    #expect(y[rows] == 777, "\(type): kernel wrote past nrows")
+                }
+            }
+        }
     }
 
     @Test func encoderRefusesUndecodableTypes() {

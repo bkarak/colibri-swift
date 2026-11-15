@@ -138,6 +138,28 @@ func referenceMatmul(_ w: [Float], cols: Int, rows: Int, _ x: [Float], batch: In
         expectClose(Array(y1.slice().floats), referenceMatmul(d2, cols: 64, rows: 7, x, batch: 1), rel: 1e-5)
     }
 
+    /// `matmulGroup` (one loop over every matrix's rows) gives `matmul`'s bits, for mixed
+    /// types, row counts that are not multiples of 4, decode and prefill, both paths.
+    @Test(arguments: [false, true])
+    func matmulGroupMatchesSeparateMatmuls(_ integer: Bool) throws {
+        var rng = TestRNG(integer ? 31 : 32)
+        let store = TestWeights(capacity: 1 << 20)
+        let specs: [(GGMLType, Int)] = [(.q4_K, 37), (.q6_K, 9), (.q8_0, 64), (.f32, 5)]
+        let ws = try specs.map { try store.matrix($0.0, cols: 512, rows: $0.1, rng: &rng).0 }
+        let cpu = CPUBackend(threads: 4, integerActivations: integer)
+        for batch in [1, 3] {
+            let xb = try buffer(cpu, rng.floats(batch * 512))
+            let grouped = try ws.map { try cpu.makeBuffer(.f32, count: batch * $0.rows, label: "g") }
+            let single = try ws.map { try cpu.makeBuffer(.f32, count: batch * $0.rows, label: "s") }
+            cpu.matmulGroup(ws, xb.slice(), into: grouped.map { $0.slice() }, batch: batch)
+            for (w, y) in zip(ws, single) { cpu.matmul(w, xb.slice(), into: y.slice(), batch: batch) }
+            for (i, (g, s)) in zip(grouped, single).enumerated() {
+                #expect(Array(g.slice().floats).map(\.bitPattern) == Array(s.slice().floats).map(\.bitPattern),
+                        "matrix \(i) (\(specs[i].0)), batch \(batch)")
+            }
+        }
+    }
+
     @Test(arguments: [false, true])
     func matmulExpertsMatchesPerExpertProducts(_ integer: Bool) throws {
         var rng = TestRNG(integer ? 77 : 78)

@@ -160,8 +160,8 @@ prompt then 128 generated tokens, median of 3 runs
 |---|---|---|
 | Metal, f32 KV | 5237 | 220 |
 | Metal, f16 KV | 5624 | 204 |
-| CPU, float path (the reference) | 345 | 37.5 |
-| CPU, `--int8` | 759 | 67.5 |
+| CPU, float path (the reference) | 345 | 157 (37.5 before the worker pool) |
+| CPU, `--int8` | 915 | 192 (67.5 before the rows kernel) |
 
 Qwen3-30B-A3B Q4_K_M (17.3 GiB, 3.3B active parameters per token), same machine and settings
 but `--batch 64` (the default then) and 2 runs:
@@ -181,8 +181,8 @@ Qwen3-4B Q4_K_M (2.3 GiB, dense, 4B parameters per token), same settings, 3 runs
 |---|---|---|
 | Metal, f32 KV | 951 | 91 |
 | Metal, f16 KV | 892 | 84 |
-| CPU, float path | 44.6 | 10.7 |
-| CPU, `--int8` | 54.8 | 15.7 |
+| CPU, float path | 45.5 | 14.9 (10.7 before the worker pool) |
+| CPU, `--int8` | 90.6 | 55.1 (15.7 before the rows kernel) |
 
 The dense 4B decodes at the speed of the 30B MoE (87 against 84 tok/s): both read about
 the same weight bytes per token.
@@ -213,6 +213,15 @@ Metal prefill to 5219 (Qwen3-0.6B), 980 (Qwen3-4B), 2840 (OLMoE) and 861 tok/s
 (Qwen3-30B-A3B): within 2x of llama.cpp on all four.
 Method and where the gap comes from: `docs/port/status.md` section 3.
 
+CPU decode with `--int8` (upstream's default path) now runs on NEON kernels that read
+the packed blocks directly, four rows at a time, on a spinning worker pool over the
+performance cores. Interleaved with llama.cpp on the same machine, 512 tokens of context
+(tok/s, coli-swift `--int8` / llama.cpp): Qwen3-4B 51-55 / 46-51, OLMoE 114 / 102,
+Qwen3-30B-A3B 44.5 / 29.9. Those runs shared the machine with another heavy job (load
+average 15-40), which costs llama.cpp more than coli-swift; on a quiet machine
+llama.cpp measured 67, 199 and 69. The float path, still the default, is 2-4x slower
+than `--int8` (it is the exact reference). Details: `docs/port/status.md` section 3.
+
 ### A model larger than memory: Qwen3-235B-A22B
 
 Qwen3-235B-A22B Q2_K (Unsloth's split file, 2 shards, 79.8 GiB, 76.6 GiB of it routed
@@ -242,7 +251,7 @@ pages to be made resident (busy about 40% of the time). With 12-24 GB the decode
 3.5-3.8 tok/s, with 32 GB 3.0; the file cache holds much of the rest. So when the experts
 do not fit, coli-swift now gives the slots half of that room (22 GiB here); whether they
 fit is still decided on the whole room, and `--expert-cache-gb` still sets the size
-exactly. CPU decode stays at 1.6-2.0 tok/s at every cache size: it is bound by the float
+exactly. CPU decode (float path, before the CPU decode work below) stays at 1.6-2.0 tok/s at every cache size: it is bound by the float
 kernels, not by reads. Details: `docs/port/status.md` section 3.
 
 ## Adding a model family

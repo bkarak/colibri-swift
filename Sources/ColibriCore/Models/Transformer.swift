@@ -223,9 +223,7 @@ public enum Transformer {
         let v = s.v.slice(0, rows * KV * vd)
 
         backend.rmsNorm(x, weight: w.norm, into: normed, rows: rows, dim: D, eps: c.rmsEps)
-        backend.matmul(w.q, normed, into: q, batch: rows)
-        backend.matmul(w.k, normed, into: k, batch: rows)
-        backend.matmul(w.v, normed, into: v, batch: rows)
+        backend.matmulGroup([w.q, w.k, w.v], normed, into: [q, k, v], batch: rows)
 
         // q/k RMSNorm before RoPE: one head at a time with a shared [hd] weight (Qwen3), or
         // across the whole projected vector (OLMoE).
