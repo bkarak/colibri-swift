@@ -197,10 +197,62 @@ Checked:
 Prefill, 512-token prompt: OLMoE 618 -> 2840 tok/s, Qwen3-30B-A3B 227 -> 861. Both are
 now within 2x of llama.cpp (4080 and 1660).
 
+### Larger than memory: Qwen3-235B-A22B
+
+Qwen3-235B-A22B Q2_K from Unsloth (`Qwen3-235B-A22B-Q2_K-0000{1,2}-of-00002.gguf`, 79.8 GiB:
+Q2_K x377, Q3_K x188, Q4_K x94, Q6_K output; 94 layers, 128 experts, top 8), opened through
+the split support, experts streamed. 64 GB M4 Max, swap already in use by other processes
+(about 11-13 GB throughout).
+
+Correctness: a chat prompt ("Explain in two sentences why the sky is blue.") gives a
+coherent answer, and Metal and CPU produce the same 48 greedy tokens (also with Metal's
+cache raised to the CPU's 38 GiB). No upstream run: upstream is single-core on macOS, and
+at about 1 tok/s on 16 cores that would take hours per prompt.
+
+Speed, `bench --prompt-tokens 512 --max-tokens 32 --runs 3`, against `llama-bench -p 512
+-n 32 -r 3` (llama.cpp v1.0.0 `b1b770d`; its decode is at depth 0 with random tokens,
+coli-swift's after the 512-token prompt with greedy tokens; tok/s):
+
+| engine, settings | prefill | decode |
+|---|---|---|
+| coli-swift Metal, `--expert-cache-gb 18` (30 of 128 slots per layer) | 17.3 | 3.6 |
+| coli-swift Metal, automatic (43 GiB, 72 slots) | 19.8 | 0.9 |
+| coli-swift CPU, automatic (44 GiB, 74 slots) | 3.1 | 1.6 |
+| coli-swift CPU, `--int8`, 18 GB | 1.2 | 0.8 |
+| llama.cpp Metal, `-ngl 99` | `kIOGPUCommandBufferCallbackErrorOutOfMemory` | |
+| llama.cpp Metal, `-ngl 40` | 8.3 | 1.8 |
+| llama.cpp Metal, `-ngl 56` | 9.9 | 0.8 |
+| llama.cpp CPU, `-ngl 0 -dev none -t 12` | 6.9 | 5.2 |
+
+Decode against the expert cache size, 64-token prompt, 32 tokens, median of 2:
+
+| cache GB | 12 | 18 | 24 | 32 | 43 (auto) |
+|---|---|---|---|---|---|
+| Metal decode tok/s | 3.6 | 3.8 | 3.5 | 3.0 | 1.9 |
+| CPU decode tok/s | 1.6 | 1.9 | 1.7 | 2.0 | (44: 1.6) |
+
+What this shows:
+- **The automatic budget is too large on Metal for a streamed model.** It follows
+  upstream (88% of available memory). With 43 GiB of slots the system swaps; a sample
+  of the decode has the main thread in `waitUntilCompleted` after each MoE layer while
+  the GPU reports itself busy only about 40% of the wall time, which points at command
+  buffers waiting for cache pages to be made resident. At 18 GB the GPU is busy 92% of
+  the time. A smaller cache loses little hit rate because the slot reads come from the
+  file cache, which then holds much of what the slots do not.
+- **Prefill is where coli-swift leads.** The tiled routed kernel processes each expert's
+  tokens together, so a 512-token prompt reads each expert a few times (about 500 GB per
+  run at 18 GB, almost all from the file cache at 30 GB/s), not once per token.
+- **CPU decode is compute-bound,** 0.5-0.6 s per token at every cache size, consistent
+  with the float kernels' speed on the 30B (22B active parameters here against 3.3B).
+  llama.cpp's CPU kernels are 5-7x faster on resident models (above), and here that
+  makes its CPU decode the fastest configuration of all.
+- **`--int8` is slower than the float path on this model** (0.8 against 1.9 tok/s at
+  18 GB): unlike Q4_K, its Q2_K and Q3_K blocks have not been profiled on the int8 path.
+
 ## 4. Known gaps
 
 **Real models run.** Qwen3-0.6B and Qwen3-4B (qwen3), Qwen3-30B-A3B (qwen3moe) and
-OLMoE-1B-7B-0125-Instruct (olmoe), all against upstream (section 2). Other quantisations of them
+OLMoE-1B-7B-0125-Instruct (olmoe), all against upstream (section 2). Qwen3-235B-A22B Q2_K (split, larger than memory) ran Metal against the CPU only (section 3). Other quantisations of them
 (only Q8_0 and Q4_K_M files were run) and the 0924 OLMoE release have not been.
 
 **First prompt on Metal (fixed).** The first forward of a process used to wait about

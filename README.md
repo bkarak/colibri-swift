@@ -101,7 +101,8 @@ experts); with `--backend auto` such a model runs on the CPU instead.
 Each family has been run as a real model against upstream: Qwen3-0.6B (Q8_0, dense),
 Qwen3-4B (Q4_K_M, dense),
 Qwen3-30B-A3B (Q4_K_M, MoE, 128 experts, top 8) and OLMoE-1B-7B-0125-Instruct (Q4_K_M, MoE,
-64 experts, top 8, Allen AI's own GGUF). All three were also verified on small random GGUFs
+64 experts, top 8, Allen AI's own GGUF). Qwen3-235B-A22B (Q2_K, split, larger than memory) was
+run on both backends, Metal against the CPU, without an upstream run. All three were also verified on small random GGUFs
 written by `Sources/ColibriCore/Synthetic/TinyModel.swift` with the real tensor layout
 (below).
 
@@ -211,6 +212,34 @@ Since then, tiled prefill kernels (dense and routed) and a default `--batch` of 
 Metal prefill to 5219 (Qwen3-0.6B), 980 (Qwen3-4B), 2840 (OLMoE) and 861 tok/s
 (Qwen3-30B-A3B): within 2x of llama.cpp on all four.
 Method and where the gap comes from: `docs/port/status.md` section 3.
+
+### A model larger than memory: Qwen3-235B-A22B
+
+Qwen3-235B-A22B Q2_K (Unsloth's split file, 2 shards, 79.8 GiB, 76.6 GiB of it routed
+experts, 22B active parameters per token) on the same 64 GB machine. coli-swift streams
+the experts through a slot cache; llama.cpp maps the whole file and lets the OS page it.
+512-token prompt, 32 generated tokens, median of 3 (tok/s):
+
+| engine, settings | prefill | decode |
+|---|---|---|
+| coli-swift Metal, `--expert-cache-gb 18` | **17.3** | 3.6 |
+| coli-swift Metal, automatic cache (43 GiB) | 19.8 | 0.9 |
+| coli-swift CPU, automatic cache (44 GiB) | 3.1 | 1.6 |
+| llama.cpp Metal, `-ngl 99` | fails: GPU out of memory | |
+| llama.cpp Metal, `-ngl 40` / `-ngl 56` | 8.3 / 9.9 | 1.8 / 0.8 |
+| llama.cpp CPU, `-t 12` | 6.9 | **5.2** |
+
+coli-swift's Metal prefill is about 2x llama.cpp's best; llama.cpp's CPU decode is about
+1.4x coli-swift's best. Both engines generate here; only llama.cpp's Metal backend cannot
+take the whole model. Metal and CPU produce the same 48 greedy tokens on a chat prompt,
+and the answer is coherent; there is no upstream oracle run at this size (upstream is
+single-core on macOS).
+
+The automatic cache is too large for a streamed model this size: at 43 GiB of anonymous
+memory the system swaps, and the GPU waits for the cache pages to be made resident (busy
+about 40% of the time). With 12-24 GB the decode is 3.5-3.8 tok/s, with 32 GB 3.0; the
+file cache holds much of the rest. CPU decode stays at 1.6-2.0 tok/s at every cache size:
+it is bound by the float kernels, not by reads. Details: `docs/port/status.md` section 3.
 
 ## Adding a model family
 
