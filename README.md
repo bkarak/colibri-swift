@@ -222,9 +222,10 @@ the experts through a slot cache; llama.cpp maps the whole file and lets the OS 
 
 | engine, settings | prefill | decode |
 |---|---|---|
-| coli-swift Metal, `--expert-cache-gb 18` | **17.3** | 3.6 |
-| coli-swift Metal, automatic cache (43 GiB) | 19.8 | 0.9 |
-| coli-swift CPU, automatic cache (44 GiB) | 3.1 | 1.6 |
+| coli-swift Metal, automatic cache (22 GiB) | **19.0** | 3.1 |
+| coli-swift Metal, `--expert-cache-gb 18` | 17.3 | 3.6 |
+| coli-swift Metal, upstream's automatic cache (43 GiB) | 19.8 | 0.9 |
+| coli-swift CPU, upstream's automatic cache (44 GiB) | 3.1 | 1.6 |
 | llama.cpp Metal, `-ngl 99` | fails: GPU out of memory | |
 | llama.cpp Metal, `-ngl 40` / `-ngl 56` | 8.3 / 9.9 | 1.8 / 0.8 |
 | llama.cpp CPU, `-t 12` | 6.9 | **5.2** |
@@ -235,11 +236,14 @@ take the whole model. Metal and CPU produce the same 48 greedy tokens on a chat 
 and the answer is coherent; there is no upstream oracle run at this size (upstream is
 single-core on macOS).
 
-The automatic cache is too large for a streamed model this size: at 43 GiB of anonymous
-memory the system swaps, and the GPU waits for the cache pages to be made resident (busy
-about 40% of the time). With 12-24 GB the decode is 3.5-3.8 tok/s, with 32 GB 3.0; the
-file cache holds much of the rest. CPU decode stays at 1.6-2.0 tok/s at every cache size:
-it is bound by the float kernels, not by reads. Details: `docs/port/status.md` section 3.
+Upstream's automatic cache (88% of available memory) was too large for a streamed model
+this size: at 43 GiB of anonymous memory the system swaps, and the GPU waits for the cache
+pages to be made resident (busy about 40% of the time). With 12-24 GB the decode is
+3.5-3.8 tok/s, with 32 GB 3.0; the file cache holds much of the rest. So when the experts
+do not fit, coli-swift now gives the slots half of that room (22 GiB here); whether they
+fit is still decided on the whole room, and `--expert-cache-gb` still sets the size
+exactly. CPU decode stays at 1.6-2.0 tok/s at every cache size: it is bound by the float
+kernels, not by reads. Details: `docs/port/status.md` section 3.
 
 ## Adding a model family
 

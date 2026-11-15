@@ -8,14 +8,28 @@ import Foundation
 ///     room   = budget - dense resident - KV cache - scratch - 0.5 GB
 ///     mode   = all experts fit in room ? resident : streaming
 ///     slots  = equal count per MoE layer, at least top-k, from per-layer slot bytes
+///              in streamShare * room
+///
+/// `streamShare` is this port's departure from upstream: a derived budget that streams
+/// gives the slots half the room (`derivedStreamShare`). Slots filling the whole room
+/// pushed a 64 GB machine into swap (Qwen3-235B-A22B on Metal: 43 GiB of slots decoded
+/// at 0.9 tok/s, with `--direct` at 0.04; 12-24 GB at 3.4-3.8). With buffered reads the
+/// file cache then holds much of what the slots do not (docs/port/status.md section 3).
 public struct MemoryBudget: Sendable {
     public var budgetBytes: Int
     public var reservedBytes: Int
+    /// Share of the room the slots get when streaming (resident or not is decided on
+    /// the whole room). 1 for an explicit `--expert-cache-gb`.
+    public var streamShare: Double
 
-    public init(budgetBytes: Int, reservedBytes: Int) {
+    public init(budgetBytes: Int, reservedBytes: Int, streamShare: Double = 1) {
         self.budgetBytes = budgetBytes
         self.reservedBytes = reservedBytes
+        self.streamShare = streamShare
     }
+
+    /// `streamShare` of a derived budget.
+    public static let derivedStreamShare = 0.5
 
     /// Activations and other headroom upstream keeps out of the expert room (0.5 GB).
     public static let activationHeadroom = 512 << 20
@@ -51,7 +65,8 @@ public struct MemoryBudget: Sendable {
 
     /// The budget for a model: an explicit expert-cache size wins (then the room is that
     /// size exactly); otherwise upstream's `resident + 0.88 * available`, capped at 85%
-    /// of physical memory, and in every case at the backend's working-set limit.
+    /// of physical memory, and in every case at the backend's working-set limit, with
+    /// `derivedStreamShare` of the room for slots when streaming.
     ///
     /// - Parameters:
     ///   - workingSetLimit: `BackendCapabilities.workingSetLimit`.
@@ -67,7 +82,8 @@ public struct MemoryBudget: Sendable {
         if let avail = availableBytes() {
             host = min(physicalCap, residentBytes + Int(Double(avail) * 0.88))
         }
-        return MemoryBudget(budgetBytes: min(workingSetLimit, host), reservedBytes: reserved)
+        return MemoryBudget(budgetBytes: min(workingSetLimit, host), reservedBytes: reserved,
+                            streamShare: derivedStreamShare)
     }
 
     public enum Plan: Sendable, Equatable {
@@ -85,7 +101,7 @@ public struct MemoryBudget: Sendable {
         let moe = layout.layers.compactMap { $0 }
         guard !moe.isEmpty else { return .resident }
         let perSlotAcrossLayers = moe.reduce(0) { $0 + ExpertArena.slotStride(for: $1) }
-        let n = room / max(1, perSlotAcrossLayers)
+        let n = Int(Double(room) * min(1, max(0, streamShare))) / max(1, perSlotAcrossLayers)
         let slots = layout.layers.map { l -> Int in
             guard let l else { return 0 }
             return min(l.count, max(topK, n))

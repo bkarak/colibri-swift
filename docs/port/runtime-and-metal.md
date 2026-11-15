@@ -145,6 +145,12 @@ unmeasured. Upstream warns that on Metal the knee is lower than on CPU, because
 registered buffers share unified memory: on a 128 GB M5 Max `--ram 110` was
 safe and `--ram 120` pushed the machine into memory compression.
 
+The port departs here: when the experts do not fit a derived budget, the slots get half
+of the room (`MemoryBudget.derivedStreamShare`). On a 64 GB M4 Max, upstream's full room
+(43 GiB of slots for Qwen3-235B-A22B) swapped and decoded at 0.9 tok/s on Metal; half
+(22 GiB) decodes at 3.1 (`docs/port/status.md` section 3). An explicit `--expert-cache-gb`
+is still the slots' size exactly.
+
 ### 2.6 Persistence of routing history (`.coli_usage`)
 
 Text, one sparse record per line, written next to the model, every turn:

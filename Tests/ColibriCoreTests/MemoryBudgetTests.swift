@@ -39,4 +39,23 @@ import Testing
         #expect(big.budgetBytes <= Int(Double(MemoryBudget.physicalBytes) * 0.85))
         #expect(big.budgetBytes > 0)
     }
+
+    @Test func derivedStreamingGivesTheSlotsHalfTheRoom() throws {
+        let fx = try ExpertFixture()
+        let perSlot = (1 ... 3).reduce(0) { $0 + ExpertArena.slotStride(for: fx.layout.layers[$1]!) }
+        // Resident or not is still decided on the whole room.
+        let total = fx.layout.totalBytes
+        #expect(MemoryBudget(budgetBytes: total, reservedBytes: 0, streamShare: 0.5).plan(layout: fx.layout, topK: 2) == .resident)
+        // Streaming: 3 slots' worth of room (below the experts' total, as above), half of
+        // it for slots: 1.5 slots, rounded down.
+        #expect(3 * perSlot < total)
+        #expect(MemoryBudget(budgetBytes: 3 * perSlot, reservedBytes: 0, streamShare: 0.5).plan(layout: fx.layout, topK: 1)
+            == .streaming(slotsPerLayer: [0, 1, 1, 1]))
+        #expect(MemoryBudget(budgetBytes: 3 * perSlot, reservedBytes: 0).plan(layout: fx.layout, topK: 1)
+            == .streaming(slotsPerLayer: [0, 3, 3, 3]))
+        // A derived budget gets the share; an explicit --expert-cache-gb is the slots' size.
+        #expect(MemoryBudget.derive(workingSetLimit: Int.max, cacheBytes: nil, residentBytes: 0).streamShare
+            == MemoryBudget.derivedStreamShare)
+        #expect(MemoryBudget.derive(workingSetLimit: Int.max, cacheBytes: 1 << 30, residentBytes: 0).streamShare == 1)
+    }
 }

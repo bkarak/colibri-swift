@@ -215,9 +215,10 @@ coli-swift's after the 512-token prompt with greedy tokens; tok/s):
 
 | engine, settings | prefill | decode |
 |---|---|---|
-| coli-swift Metal, `--expert-cache-gb 18` (30 of 128 slots per layer) | 17.3 | 3.6 |
-| coli-swift Metal, automatic (43 GiB, 72 slots) | 19.8 | 0.9 |
-| coli-swift CPU, automatic (44 GiB, 74 slots) | 3.1 | 1.6 |
+| coli-swift Metal, automatic, half the room (22 GiB, 37 of 128 slots per layer) | 19.0 | 3.1 |
+| coli-swift Metal, `--expert-cache-gb 18` (30 slots) | 17.3 | 3.6 |
+| coli-swift Metal, upstream's automatic (43 GiB, 72 slots) | 19.8 | 0.9 |
+| coli-swift CPU, upstream's automatic (44 GiB, 74 slots) | 3.1 | 1.6 |
 | coli-swift CPU, `--int8`, 18 GB | 1.2 | 0.8 |
 | llama.cpp Metal, `-ngl 99` | `kIOGPUCommandBufferCallbackErrorOutOfMemory` | |
 | llama.cpp Metal, `-ngl 40` | 8.3 | 1.8 |
@@ -231,14 +232,21 @@ Decode against the expert cache size, 64-token prompt, 32 tokens, median of 2:
 | Metal decode tok/s | 3.6 | 3.8 | 3.5 | 3.0 | 1.9 |
 | CPU decode tok/s | 1.6 | 1.9 | 1.7 | 2.0 | (44: 1.6) |
 
+With `--direct` (`F_NOCACHE`) on Metal: 21 GB 3.4 tok/s, 43 GB 0.04 (31 tokens in 690 s).
+
 What this shows:
-- **The automatic budget is too large on Metal for a streamed model.** It follows
-  upstream (88% of available memory). With 43 GiB of slots the system swaps; a sample
-  of the decode has the main thread in `waitUntilCompleted` after each MoE layer while
-  the GPU reports itself busy only about 40% of the wall time, which points at command
-  buffers waiting for cache pages to be made resident. At 18 GB the GPU is busy 92% of
-  the time. A smaller cache loses little hit rate because the slot reads come from the
-  file cache, which then holds much of what the slots do not.
+- **Upstream's automatic budget was too large for a streamed model (fixed).** With
+  88% of available memory as slots (43 GiB) the system swaps; a sample of the decode
+  has the main thread in `waitUntilCompleted` after each MoE layer while the GPU
+  reports itself busy only about 40% of the wall time, which points at command buffers
+  waiting for cache pages to be made resident. At 18 GB the GPU is busy 92% of the
+  time. A smaller cache loses little because the slot reads come from the file cache,
+  which then holds much of what the slots do not. `MemoryBudget` now gives the slots
+  `derivedStreamShare` (half) of the derived room when the experts do not fit; the
+  resident-or-streamed decision still uses the whole room, as upstream, and an explicit
+  `--expert-cache-gb` is the slots' size exactly. Qwen3-235B-A22B on Metal: 22 GiB, decode
+  0.9 -> 3.1 tok/s, prefill unchanged (19.8 -> 19.0); CPU decode unchanged (1.7);
+  Qwen3-30B-A3B and OLMoE still resident.
 - **Prefill is where coli-swift leads.** The tiled routed kernel processes each expert's
   tokens together, so a 512-token prompt reads each expert a few times (about 500 GB per
   run at 18 GB, almost all from the file cache at 30 GB/s), not once per token.
