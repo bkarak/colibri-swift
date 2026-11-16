@@ -15,6 +15,10 @@ the tests and `scripts/oracle/` compare against.
 
 No package dependencies: Swift 6 toolchain, Foundation, Metal.
 
+The project's page is [bkarak.wizhut.tech/software/colibri-swift](https://bkarak.wizhut.tech/software/colibri-swift),
+and the post [Porting colibri to Swift](https://bkarak.wizhut.tech/blog/2026/16112026) tells how
+the port was done and how it compares with llama.cpp.
+
 ## Build
 
 ```bash
