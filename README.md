@@ -78,7 +78,7 @@ Main options (`coli-swift --help` lists all):
 | `--kv f32\|f16` | KV cache element type (default f32) |
 | `--experts auto\|resident\|stream`, `--expert-cache-gb G`, `--direct` | expert placement, cache budget, uncached (`F_NOCACHE`) expert reads |
 | `--raw`, `--system`, `--think` | template control |
-| `--int8` | CPU only: upstream's default int8-activation matmuls instead of the float path |
+| `--float`, `--int8` | CPU only: the float path (upstream `GQ_EXACT=1`, the exact reference, 2-4x slower) or int8 activations (the default, upstream's default path) |
 | `--dump`, `--dump-logits PATH`, `--prompt-ids`, `--ignore-eos` | oracle and debugging aids |
 
 ## Supported models
@@ -111,7 +111,9 @@ written by `Sources/ColibriCore/Synthetic/TinyModel.swift` with the real tensor 
 Upstream's engines were built from source (`scripts/oracle/build-upstream.sh`) and run in
 their float reference mode (`GQ_EXACT=1`, f32 KV cache, greedy, no EOS stop). Their outputs
 are fixtures in `Tests/ColibriCoreTests/Fixtures/oracle/`. `scripts/oracle/compare.sh`
-runs `coli-swift generate` on every fixture prompt and reports the first divergence.
+runs `coli-swift generate` on every fixture prompt and reports the first divergence. The
+CPU column is the float path (`--float`, which `compare.sh` passes); the CPU default,
+int8 activations, is the `--int8` row.
 
 | check | CPU | Metal |
 |---|---|---|
@@ -127,7 +129,7 @@ runs `coli-swift generate` on every fixture prompt and reports the first diverge
 | resident vs streamed experts, 4 synthetic MoE models x 128 tokens | identical | identical |
 | Metal vs CPU on Qwen3-0.6B: 5 prompts x 128 tokens, f32 and f16 KV | | identical |
 | Metal vs CPU on Qwen3-0.6B: a 2654-token prompt x 96 tokens, f32 and f16 KV | | identical |
-| `--int8` vs upstream's default int8 path | Qwen3-0.6B 5/5, Qwen3-4B 5/5, Qwen3-30B-A3B 3/5, OLMoE 3/5, synthetic 54/64 (see `docs/port/status.md`) | n/a |
+| CPU default (int8 activations, `--int8`) vs upstream's default int8 path | Qwen3-0.6B 5/5, Qwen3-4B 5/5, Qwen3-30B-A3B 3/5, OLMoE 3/5, synthetic 54/64 (see `docs/port/status.md`) | n/a |
 | upstream's golden quant blocks (14 types) through the Metal kernels | | embed bit-exact except BF16 subnormals (flushed to 0); matvec within 1e-5 of magnitude of upstream's `gq_matmul_f32` |
 | a model shape Metal does not support (synthetic qwen3, head dim 512), release build | runs, finite logits | refused at load; `--backend auto` falls back to the CPU |
 | an expert read that fails mid-run (streamed qwen3moe, file truncated after load) | the forward throws | the forward throws |
@@ -160,8 +162,8 @@ prompt then 128 generated tokens, median of 3 runs
 |---|---|---|
 | Metal, f32 KV | 5237 | 220 |
 | Metal, f16 KV | 5624 | 204 |
-| CPU, float path (the reference) | 345 | 157 (37.5 before the worker pool) |
-| CPU, `--int8` | 915 | 192 (67.5 before the rows kernel) |
+| CPU, int8 activations (default) | 915 | 192 (67.5 before the rows kernel) |
+| CPU, `--float` (the reference) | 345 | 157 (37.5 before the worker pool) |
 
 Qwen3-30B-A3B Q4_K_M (17.3 GiB, 3.3B active parameters per token), same machine and settings
 but `--batch 64` (the default then) and 2 runs:
@@ -181,8 +183,8 @@ Qwen3-4B Q4_K_M (2.3 GiB, dense, 4B parameters per token), same settings, 3 runs
 |---|---|---|
 | Metal, f32 KV | 951 | 91 |
 | Metal, f16 KV | 892 | 84 |
-| CPU, float path | 45.5 | 14.9 (10.7 before the worker pool) |
-| CPU, `--int8` | 90.6 | 55.1 (15.7 before the rows kernel) |
+| CPU, int8 activations (default) | 90.6 | 55.1 (15.7 before the rows kernel) |
+| CPU, `--float` | 45.5 | 14.9 (10.7 before the worker pool) |
 
 The dense 4B decodes at the speed of the 30B MoE (87 against 84 tok/s): both read about
 the same weight bytes per token.
@@ -213,14 +215,15 @@ Metal prefill to 5219 (Qwen3-0.6B), 980 (Qwen3-4B), 2840 (OLMoE) and 861 tok/s
 (Qwen3-30B-A3B): within 2x of llama.cpp on all four.
 Method and where the gap comes from: `docs/port/status.md` section 3.
 
-CPU decode with `--int8` (upstream's default path) now runs on NEON kernels that read
+CPU decode with int8 activations (upstream's default path, and the CPU default here since
+it became fast) runs on NEON kernels that read
 the packed blocks directly, four rows at a time, on a spinning worker pool over the
 performance cores. Interleaved with llama.cpp on the same machine, 512 tokens of context
-(tok/s, coli-swift `--int8` / llama.cpp): Qwen3-4B 51-55 / 46-51, OLMoE 114 / 102,
+(tok/s, coli-swift / llama.cpp): Qwen3-4B 51-55 / 46-51, OLMoE 114 / 102,
 Qwen3-30B-A3B 44.5 / 29.9. Those runs shared the machine with another heavy job (load
 average 15-40), which costs llama.cpp more than coli-swift; on a quiet machine
-llama.cpp measured 67, 199 and 69. The float path, still the default, is 2-4x slower
-than `--int8` (it is the exact reference). Details: `docs/port/status.md` section 3.
+llama.cpp measured 67, 199 and 69. The float path (`--float`, the exact reference) is
+2-4x slower. Details: `docs/port/status.md` section 3.
 
 ### A model larger than memory: Qwen3-235B-A22B
 

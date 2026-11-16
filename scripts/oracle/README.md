@@ -116,7 +116,7 @@ scripts/oracle/compare.sh                         # cpu, all 16 tiny cases + Qwe
 scripts/oracle/compare.sh --backend metal
 scripts/oracle/compare.sh --tiny-only -- --experts stream     # forced expert streaming
 scripts/oracle/compare.sh --ids                   # feed upstream's prompt ids, skip the tokenizer
-scripts/oracle/compare.sh --reference default     # coli-swift --int8 vs upstream's int8 path
+scripts/oracle/compare.sh --reference default     # coli-swift --int8 (the CPU default) vs upstream's int8 path
 scripts/oracle/compare.sh --cases olmoe_q8_0 --verbose
 ```
 

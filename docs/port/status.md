@@ -26,7 +26,8 @@ Reference: upstream built from source (`scripts/oracle/build-upstream.sh`), run 
 mode (`GQ_EXACT=1`, f32 KV cache, greedy, never stopping at EOS). Fixtures:
 `Tests/ColibriCoreTests/Fixtures/oracle/`. Comparison: `scripts/oracle/compare.sh`, which
 reports MATCH, NEAR-TIE (diverged where upstream's own top-2 logit gap is under 0.01) or
-DIVERGED with the step.
+DIVERGED with the step. CPU rows are the float path: `compare.sh` passes `--float`, since
+the CPU default is int8 activations (section 3); the `--int8` rows are that default.
 
 | case | backend | matches upstream | first divergence |
 |---|---|---|---|
@@ -58,12 +59,12 @@ DIVERGED with the step.
 Commands:
 
 ```bash
-scripts/oracle/compare.sh                                                # CPU
+scripts/oracle/compare.sh                                                # CPU, --float
 scripts/oracle/compare.sh --no-build --backend metal
 scripts/oracle/compare.sh --no-build --backend metal -- --kv f16
 scripts/oracle/compare.sh --no-build --tiny-only -- --expert-cache-gb 0.001
 scripts/oracle/compare.sh --no-build --backend metal --tiny-only -- --expert-cache-gb 0.001 --batch 4
-scripts/oracle/compare.sh --no-build --reference default                 # --int8
+scripts/oracle/compare.sh --no-build --reference default                 # --int8 (CPU default)
 ```
 
 `swift test` (162 tests: 136 in ColibriCoreTests, 26 in ColibriMetalTests; the benchmarks
@@ -203,8 +204,16 @@ decoded at 220 (0.6B), 67.4 (4B), 199 (OLMoE) and 69.3 (30B); coli-swift has not
 measured on a quiet machine since. Qwen3-235B-A22B streamed, 64-token prompt, 32 tokens:
 `--int8` 1.3-1.9 tok/s, float 1.1, llama.cpp 1.66, all bound by expert reads.
 
-The float path (default, upstream's exact reference) gained only from the pool: its
-kernels dequantise to fp32 and multiply-add per weight, 2-4x the work of `sdot` on int8.
+The float path (upstream's exact reference) gained only from the pool: its kernels
+dequantise to fp32 and multiply-add per weight, 2-4x the work of `sdot` on int8.
+
+**CPU default: int8 activations.** With these kernels the CLI's CPU backend defaults to
+int8 activations, as upstream's own CPU path does; `--float` selects the float path (the
+exact reference, `GQ_EXACT=1`), and `compare.sh` passes it for the exact comparison.
+Either flag is a CPU option: with `--backend auto` it selects the CPU, with `--backend
+metal` it is refused. `CPUBackend` itself still defaults to the float path, the
+reference every other backend is tested against. The startup line names the path
+(`backend cpu (int8 activations), 12 threads`).
 
 ### Tiled prefill kernel
 

@@ -60,6 +60,8 @@ def run_job(j, a):
         cmd += ['--threads', str(a.threads)]
     if a.reference == 'default':
         cmd += ['--int8']
+    elif a.backend == 'cpu':
+        cmd += ['--float']  # the CPU default is int8; the exact reference is the float path
     cmd += a.extra
     t0 = time.time()
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -110,8 +112,8 @@ def main():
     ap.add_argument('--models', required=True, help='directory with the tiny <case>.gguf files and manifest.json')
     ap.add_argument('--backend', default='cpu', choices=['cpu', 'metal', 'auto'])
     ap.add_argument('--reference', default='exact', choices=['exact', 'default'],
-                    help='exact: upstream GQ_EXACT=1 ids (float math); default: upstream int8-activation ids, '
-                         'compared with coli-swift --int8 (cpu only)')
+                    help='exact: upstream GQ_EXACT=1 ids (float math; coli-swift --float on the cpu); '
+                         'default: upstream int8-activation ids, compared with coli-swift --int8 (cpu only)')
     ap.add_argument('--cases', default='', help='comma-separated tiny case names (default: all)')
     ap.add_argument('--tiny-only', action='store_true')
     ap.add_argument('--real-only', action='store_true')

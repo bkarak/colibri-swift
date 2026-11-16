@@ -41,8 +41,11 @@ struct CLIOptions {
     var kvType: ScalarType = .f32
     var maxBatch = 512
     var stats = false
-    /// CPU: upstream's default int8-activation path instead of the float path.
-    var int8 = false
+    /// CPU math: nil = the default, int8 activations (upstream's default path, as fast as
+    /// llama.cpp); `--float` = the float path (upstream GQ_EXACT=1, the exact reference).
+    /// Either flag is a CPU option: with `--backend auto` it selects the CPU.
+    enum CPUMath { case int8, float }
+    var cpuMath: CPUMath?
     var promptTokens = 128
     var runs = 1
 
@@ -87,7 +90,8 @@ struct CLIOptions {
       --kv f32|f16             KV cache element type (default f32)
       --batch N                largest prefill chunk in tokens (default 512)
       --stats                  bench/chat: print expert cache counters (generate always prints them for MoE models)
-      --int8                   cpu: int8 activations (upstream's default) instead of float
+      --int8                   cpu: int8 activations (the default; upstream's default path)
+      --float                  cpu: the float path (upstream GQ_EXACT=1, exact reference; 2-4x slower)
       --prompt-tokens N        bench: prompt length when --prompt is not given (default 128)
       --runs N                 bench: measured runs (default 1)
     """
@@ -163,7 +167,8 @@ struct CLIOptions {
                 }
             case "--batch": o.maxBatch = try number(a, Int.self)
             case "--stats": o.stats = true
-            case "--int8": o.int8 = true
+            case "--int8": o.cpuMath = .int8
+            case "--float": o.cpuMath = .float
             case "--prompt-tokens": o.promptTokens = try number(a, Int.self)
             case "--runs": o.runs = try number(a, Int.self)
             default:

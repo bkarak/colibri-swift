@@ -4,20 +4,24 @@ import ColibriCore
 import ColibriMetal
 import Foundation
 
-func makeCPU(_ o: CLIOptions) -> Backend { CPUBackend(threads: o.threads, integerActivations: o.int8) }
+/// The CPU backend: int8 activations unless `--float` (`CPUBackend` itself defaults to the
+/// float path, the reference the tests compare against).
+func makeCPU(_ o: CLIOptions) -> Backend {
+    CPUBackend(threads: o.threads, integerActivations: (o.cpuMath ?? .int8) == .int8)
+}
 
 /// The backend `--backend` names. `auto` is Metal on Apple Silicon and the CPU
-/// otherwise (and for `--int8`, a CPU-only path); `load` falls back to the CPU when
-/// Metal cannot start or cannot load the model.
+/// otherwise (and for `--int8` or `--float`, CPU-only options); `load` falls back to
+/// the CPU when Metal cannot start or cannot load the model.
 func makeBackend(_ o: CLIOptions) throws -> Backend {
     switch o.backend {
     case .cpu: return makeCPU(o)
     case .metal:
-        if o.int8 { throw CLIOptions.ParseError(description: "--int8 is a CPU backend option") }
+        if o.cpuMath != nil { throw CLIOptions.ParseError(description: "--int8 and --float are CPU backend options") }
         return try MetalBackend()
     case .auto:
         #if arch(arm64)
-        if o.int8 { return makeCPU(o) }
+        if o.cpuMath != nil { return makeCPU(o) }
         do {
             return try MetalBackend()
         } catch {
@@ -93,6 +97,10 @@ func modelSummary(_ m: LoadedModel, backend: Backend, path: String) -> String {
         s += ", FFN \(c.ffnDim)"
     }
     s += "\n  backend \(backend.capabilities.name)"
+    if let cpu = backend as? CPUBackend {
+        s += cpu.integerActivations ? " (int8 activations)" : " (float path)"
+        s += ", \(cpu.threads) threads"
+    }
     if let store = expertStore(m) {
         s += ", experts " + placement(store)
     }
