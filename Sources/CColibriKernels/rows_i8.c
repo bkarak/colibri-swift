@@ -127,6 +127,7 @@ static inline __attribute__((always_inline)) void block_scales4(int type, const 
     case T_Q5_K: {
         const float32x4_t d = half4(b, 0), dmin = half4(b, 2);
         uint8x8_t sc[4], mn[4];
+        #pragma clang loop unroll(full)
         for (int k = 0; k < 4; k++) k4_scales(b[k] + 4, &sc[k], &mn[k]);
         uint8x16_t ts[2], tm[2];
         transpose4x8(sc[0], sc[1], sc[2], sc[3], ts);
@@ -134,6 +135,7 @@ static inline __attribute__((always_inline)) void block_scales4(int type, const 
         float32x4_t fs[8], fm[8];
         widen_u(ts[0], fs); widen_u(ts[1], fs + 4);
         widen_u(tm[0], fm); widen_u(tm[1], fm + 4);
+        #pragma clang loop unroll(full)
         for (int g = 0; g < 8; g++) {
             SW[2 * g] = SW[2 * g + 1] = vmulq_f32(d, fs[g]);
             MW[2 * g] = MW[2 * g + 1] = vmulq_f32(dmin, fm[g]);
@@ -144,9 +146,11 @@ static inline __attribute__((always_inline)) void block_scales4(int type, const 
         const float32x4_t d = half4(b, 208);
         uint8x16_t t[4];
         transpose4x16(vld1q_u8(b[0] + 192), vld1q_u8(b[1] + 192), vld1q_u8(b[2] + 192), vld1q_u8(b[3] + 192), t);
+        #pragma clang loop unroll(full)
         for (int q = 0; q < 4; q++) {
             float32x4_t f[4];
             widen_s(t[q], f);
+            #pragma clang loop unroll(full)
             for (int i = 0; i < 4; i++) SW[4 * q + i] = vmulq_f32(d, f[i]);
         }
         return;
@@ -154,13 +158,16 @@ static inline __attribute__((always_inline)) void block_scales4(int type, const 
     case T_Q2_K: {
         const float32x4_t d = half4(b, 80), dmin = half4(b, 82);
         uint8x16_t r[4], ts[4], tm[4];
+        #pragma clang loop unroll(full)
         for (int k = 0; k < 4; k++) r[k] = vld1q_u8(b[k]);
         const uint8x16_t lo = vdupq_n_u8(0x0F);
         transpose4x16(vandq_u8(r[0], lo), vandq_u8(r[1], lo), vandq_u8(r[2], lo), vandq_u8(r[3], lo), ts);
         transpose4x16(vshrq_n_u8(r[0], 4), vshrq_n_u8(r[1], 4), vshrq_n_u8(r[2], 4), vshrq_n_u8(r[3], 4), tm);
+        #pragma clang loop unroll(full)
         for (int q = 0; q < 4; q++) {
             float32x4_t fs[4], fm[4];
             widen_u(ts[q], fs); widen_u(tm[q], fm);
+            #pragma clang loop unroll(full)
             for (int i = 0; i < 4; i++) {
                 SW[4 * q + i] = vmulq_f32(d, fs[i]);
                 MW[4 * q + i] = vmulq_f32(dmin, fm[i]);
@@ -172,9 +179,11 @@ static inline __attribute__((always_inline)) void block_scales4(int type, const 
         const float32x4_t d = half4(b, 108);
         uint8x16_t t[4];
         transpose4x16(q3_scales(b[0] + 96), q3_scales(b[1] + 96), q3_scales(b[2] + 96), q3_scales(b[3] + 96), t);
+        #pragma clang loop unroll(full)
         for (int q = 0; q < 4; q++) {
             float32x4_t f[4];
             widen_s(t[q], f);
+            #pragma clang loop unroll(full)
             for (int i = 0; i < 4; i++) SW[4 * q + i] = vmulq_f32(d, f[i]);
         }
         return;
@@ -274,6 +283,7 @@ static inline __attribute__((always_inline)) void rows_k(
     const int32x4_t z = vdupq_n_s32(0);
     for (int o = 0; o < nrows; o += 4) {
         const uint8_t *r[4];
+        #pragma clang loop unroll(full)
         for (int k = 0; k < 4; k++) r[k] = base + (size_t)(o + k < nrows ? o + k : nrows - 1) * rowBytes;
         float32x4_t acc = vdupq_n_f32(0), accB = vdupq_n_f32(0), m = vdupq_n_f32(0);
         float32x4_t SW[16], MW[16];
@@ -288,6 +298,7 @@ static inline __attribute__((always_inline)) void rows_k(
                 const int P = blk * ppb + p;
                 const int8x16_t x0 = vld1q_s8(xq + 32 * P), x1 = vld1q_s8(xq + 32 * P + 16);
                 int32x4_t A[4], B[4];
+                #pragma clang loop unroll(full)
                 for (int k = 0; k < 4; k++) {
                     int8x16_t wa, wb;
                     pair_codes(type, rb[k], p, &wa, &wb);

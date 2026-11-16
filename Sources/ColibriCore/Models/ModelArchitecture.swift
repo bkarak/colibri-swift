@@ -14,7 +14,7 @@ public struct LoadContext {
     public var maxBatch: Int
 
     public init(backend: Backend, expertOptions: ExpertStoreOptions = ExpertStoreOptions(),
-                maxContext: Int = 4096, kvType: ScalarType = .f32, maxBatch: Int = 64) {
+                maxContext: Int = 4096, kvType: ScalarType = .f32, maxBatch: Int = 512) {
         self.backend = backend
         self.expertOptions = expertOptions
         self.maxContext = maxContext

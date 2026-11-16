@@ -170,7 +170,8 @@ public struct ExpertStoreOptions: Sendable {
     public var saveHistory: Bool
     /// Read experts with `F_NOCACHE` (upstream `DIRECT=1`): the reads go to the SSD and
     /// leave no duplicate in the unified buffer cache, so streaming is measured honestly.
-    /// Off = buffered `pread` (a warm page cache then serves the reads at RAM speed).
+    /// Off (the default, as in the CLI without `--direct`) = buffered `pread` (a warm page
+    /// cache then serves the reads at RAM speed).
     public var uncached: Bool
     /// Live repin every N tokens (`--repin N`, colibri c/tier.h); 0 = off.
     public var repinEvery: Int
@@ -180,7 +181,7 @@ public struct ExpertStoreOptions: Sendable {
 
     public init(mode: Mode = .auto, cacheBytes: Int? = nil, slotsPerLayer: Int? = nil, ioThreads: Int = 8,
                 pilot: Bool = false, historyPath: String? = nil, saveHistory: Bool = true,
-                uncached: Bool = true, repinEvery: Int = 0, extraResidentBytes: Int = 0) {
+                uncached: Bool = false, repinEvery: Int = 0, extraResidentBytes: Int = 0) {
         self.mode = mode
         self.cacheBytes = cacheBytes
         self.slotsPerLayer = slotsPerLayer

@@ -81,6 +81,51 @@ Main options (`coli-swift --help` lists all):
 | `--float`, `--int8` | CPU only: the float path (upstream `GQ_EXACT=1`, the exact reference, 2-4x slower) or int8 activations (the default, upstream's default path) |
 | `--dump`, `--dump-logits PATH`, `--prompt-ids`, `--ignore-eos` | oracle and debugging aids |
 
+## Use as a library
+
+Add the package and depend on the `Colibri` product (it re-exports `ColibriCore`):
+
+```swift
+// Package.swift
+.package(url: "https://github.com/bkarak/colibri-swift", branch: "main"),
+// target
+.product(name: "Colibri", package: "colibri-swift"),
+```
+
+```swift
+import Colibri
+
+let engine = try await ColibriEngine.load(modelPath: "/path/to/Qwen3-4B-Q4_K_M.gguf")
+
+// One reply, streamed.
+for try await text in engine.respond(to: [ChatMessage(role: .user, content: "Hi!")]) {
+    print(text, terminator: "")
+}
+
+// A conversation: history kept, cached prefix reused, oldest turns dropped when full.
+let chat = ChatSession(engine: engine, system: "Answer briefly.")
+print(try await chat.reply("What is a mixture of experts?"))
+
+// Sampling, length, Qwen3 thinking.
+let options = GenerationOptions(maxTokens: 256, sampling: SamplerConfig(temperature: 0.7, topP: 0.8, topK: 20))
+```
+
+- `EngineConfiguration` has the CLI's options and defaults: `compute` (`.auto`: Metal,
+  else the CPU), `cpuMath` (`.int8` or `.float`), `threads`, `contextLength`, `maxBatch`,
+  `kvCache`, `experts`, `expertCacheGB`, `directIO`, `saveRoutingHistory`.
+- Generation runs on the engine's own serial queue, never on the caller's thread or the
+  cooperative pool; calls from any task are queued and run one at a time. Breaking out of
+  the `for try await` loop (or cancelling the task) stops the generation at the next
+  token. `ColibriEngine` and `ChatSession` are `Sendable`.
+- `complete(_:)` continues raw text; `reply(to:)` collects a reply; `lastStats` has the
+  prefill and decode counters; `tokenCount(of:)` measures a conversation.
+- For tokens, logits or your own loop, use the layers below: `ModelRegistry.load`,
+  `Generator`, `StreamingDecoder`, the backends (`CPUBackend`, `MetalBackend`).
+
+The package has no unsafe build flags, so it works as a dependency pinned by version
+too. The first prompt after the model file has left the OS file cache reads the weights
+from disk (seconds for a 17 GB model).
+
 ## Supported models
 
 | GGUF `general.architecture` | models | family file |

@@ -11,36 +11,38 @@ import PackageDescription
 // `@unchecked Sendable` wrappers on nearly every hot-path type without adding safety
 // (the synchronisation is explicit: locks, conditions, Metal command completion).
 //
-// Release builds of the engine use -Ounchecked: the kernels index raw buffers in tight
-// loops and the bounds/overflow traps of -O measurably cost there. -Ounchecked also
-// removes `precondition`, so nothing that guards against wrong output may rely on one:
-// backend limits are enforced when a model loads (`Backend.checkSupport`, which throws),
-// and the Metal backend's per-op checks use `fatalError`, which stays. The debug-build
-// test suite keeps every check.
+// No unsafe build flags: SwiftPM refuses them in a package that is a version-pinned
+// dependency, so they would keep the package from being used as a library. Release builds
+// are SwiftPM's -O (Swift) and -Os (C). The C kernels get what they need from the source
+// (forced inlining and explicitly unrolled loops in rows_i8.c; with those, -Os matches
+// -O3), and -O instead of -Ounchecked costs nothing measurable on Metal and up to ~7% of
+// CPU decode on Qwen3-0.6B (none measurable on the 4B and 30B). Preconditions stay on in
+// release builds; backend limits are still enforced when a model loads.
 let engineSettings: [SwiftSetting] = [
     .swiftLanguageMode(.v5),
-    .unsafeFlags(["-Ounchecked"], .when(configuration: .release)),
 ]
 
 let package = Package(
     name: "colibri-swift",
     platforms: [.macOS(.v15)],
     products: [
+        // The facade: load a model, stream text (Sources/Colibri). Re-exports ColibriCore.
+        .library(name: "Colibri", targets: ["Colibri"]),
         .library(name: "ColibriCore", targets: ["ColibriCore"]),
         .library(name: "ColibriMetal", targets: ["ColibriMetal"]),
         .executable(name: "coli-swift", targets: ["coli-swift"]),
     ],
     targets: [
-        // NEON kernels and the CPU worker pool (C, no dependencies). Release builds use
-        // -O3: SwiftPM's default -Os for C left the per-type helpers of the rows kernel
-        // out of line, with the type switch evaluated per call.
-        .target(name: "CColibriKernels",
-                cSettings: [.unsafeFlags(["-O3"], .when(configuration: .release))]),
+        // NEON kernels and the CPU worker pool (C, no dependencies).
+        .target(name: "CColibriKernels"),
         .target(
             name: "ColibriCore",
             dependencies: ["CColibriKernels"],
             swiftSettings: engineSettings
         ),
+        // Swift 6 language mode: it is what apps call, so it is checked for data races.
+        .target(name: "Colibri", dependencies: ["ColibriCore", "ColibriMetal"]),
+        .testTarget(name: "ColibriTests", dependencies: ["Colibri"]),
         .target(
             name: "ColibriMetal",
             dependencies: ["ColibriCore"],

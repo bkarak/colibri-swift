@@ -20,6 +20,9 @@ store to the CLI, and Metal decode attention splits long contexts across threadg
 ```
 Package.swift                      tools 6.0, macOS 15+, no dependencies
 Sources/
+  Colibri/                         library facade: ColibriEngine, ChatSession (load a GGUF,
+                                   stream text; Swift 6 mode; re-exports ColibriCore)
+  CColibriKernels/                 C: NEON int8 rows kernel (rows_i8.c), CPU worker pool (pool.c)
   ColibriCore/                     library: everything except Metal
     Support/      Errors.swift, Concurrency.swift (UnsafeSendable, alignUp, hostPageSize)
     GGUF/         GGUFValue.swift (value model, GGUFMetadata), GGUFFile.swift (reader),
