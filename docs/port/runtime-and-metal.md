@@ -223,7 +223,7 @@ per routing decision for offline analysis.
 
 ## 4. Facts about this machine (measured 2026-11-14)
 
-Probe programs in the session scratchpad, built with `swiftc -O`:
+Small probe programs (not kept in the repository), built with `swiftc -O`:
 
 | quantity | value |
 |---|---|

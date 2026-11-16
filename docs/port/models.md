@@ -362,13 +362,15 @@ Not upstream, but what the Qwen3 model card recommends: thinking mode temp 0.6, 
 ### Build (done once, native, no libomp needed)
 
 ```bash
-mkdir -p /private/tmp/claude-501/colibri-oracle
-cp -R /Users/bkarak/devel/personal/_upstream/colibri/c /private/tmp/claude-501/colibri-oracle/c
-cd /private/tmp/claude-501/colibri-oracle/c && make qwen36 olmoe
+# UPSTREAM: a checkout of https://github.com/JustVugg/colibri at 0a5504a
+# ORACLE_DIR: scripts/oracle's working directory (default ${TMPDIR:-/tmp}/colibri-oracle)
+mkdir -p "$ORACLE_DIR"
+cp -R "$UPSTREAM/c" "$ORACLE_DIR/c"
+cd "$ORACLE_DIR/c" && make qwen36 olmoe
 # clang -O3 ... qwen36.c -o qwen36 -lm   (single-threaded, ~6 s for both)
 ```
 
-Both binaries are already built at `/private/tmp/claude-501/colibri-oracle/c/{qwen36,olmoe}` (a reboot can clear `/private/tmp`).
+The binaries land in `$ORACLE_DIR/c/{qwen36,olmoe}` (under `/tmp` by default, which a reboot can clear); `scripts/oracle/build-upstream.sh` does the same.
 
 ### qwen3 / qwen3moe: `qwen36` takes the raw GGUF
 
@@ -396,7 +398,7 @@ SNAP=<file.gguf> [env] ./qwen36 [cache/layer] [expert_bits] [prompt.txt | ref.js
 ### olmoe: needs an imported directory
 
 ```bash
-python3 /private/tmp/claude-501/colibri-oracle/c/tools/gguf_import.py <file.gguf> <out_dir>   # what `coli import` runs; stdlib only, link mode
+python3 "$ORACLE_DIR/c/tools/gguf_import.py" <file.gguf> <out_dir>   # what `coli import` runs; stdlib only, link mode
 SNAP=<out_dir> [env] ./olmoe [cache/layer=16] [bits=8] ref.json
 ```
 
@@ -411,7 +413,7 @@ SNAP=<out_dir> [env] ./olmoe [cache/layer=16] [bits=8] ref.json
 
 ### Synthetic models for the MoE archs
 
-`/private/tmp/claude-501/colibri-oracle/mk_tiny_gguf.py` (stdlib only, written for this doc) writes a tiny random GGUF for `qwen3`, `qwen3moe` or `olmoe`: `D`=64, `L`=2, `H`=4, `KV`=2 (qwen) or 4 (olmoe), `hd`=32 (qwen, so `H*hd` != `D`) or 16 (olmoe), `E`=8, `K`=2, `I`=32, `F`=96, a 256-byte-symbol vocab plus a few control tokens (`V` = 261 qwen, 259 olmoe), no merges. Weights are Gaussian with a fixed seed; norms 1 ± 0.1; router F32.
+`mk_tiny_gguf.py` (a stdlib-only throwaway written for this doc and not kept; `Sources/ColibriCore/Synthetic/TinyModel.swift` does the job now) wrote a tiny random GGUF for `qwen3`, `qwen3moe` or `olmoe`: `D`=64, `L`=2, `H`=4, `KV`=2 (qwen) or 4 (olmoe), `hd`=32 (qwen, so `H*hd` != `D`) or 16 (olmoe), `E`=8, `K`=2, `I`=32, `F`=96, a 256-byte-symbol vocab plus a few control tokens (`V` = 261 qwen, 259 olmoe), no merges. Weights are Gaussian with a fixed seed; norms 1 ± 0.1; router F32.
 
 ```bash
 python3 -I mk_tiny_gguf.py qwen3moe tiny_qwen3moe.gguf --type q8_0      # or --type f32, --seed N, --tied (qwen3)
